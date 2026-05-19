@@ -135,6 +135,11 @@ struct TurnOutput {
     /// 1–2 sentence position statement.
     claim: String,
     /// Specific phrase or detail from the memory that supports the claim.
+    /// Required by the prompt; tolerant-deserialised because Haiku occasionally
+    /// omits the field. An empty string lets the dialogue continue rather than
+    /// fail the whole candidate; the resulting turn just carries no evidence
+    /// citation, which the synthesizer can still arbitrate around.
+    #[serde(default)]
     evidence: String,
     /// If set, the persona is conceding to the other side. Should describe
     /// what specifically is being conceded to, not just "ok you're right".
@@ -203,6 +208,13 @@ struct SynthesizerOutput {
     /// type system accepts an opaque `Value`. **Stage 3 must validate
     /// action-specific shape before dispatch** (CLA-100). Stage 2 writes
     /// the payload to the audit row as-is.
+    ///
+    /// Tolerant-deserialised: Haiku occasionally omits the field entirely.
+    /// Missing → `Value::Null`, which `dialectic_validation.rs` rejects for
+    /// reframe/flag actions; the fail-closed dispatcher then silently skips
+    /// the candidate. For `keep` actions an empty payload is the expected
+    /// shape anyway, so a missing field is functionally identical.
+    #[serde(default)]
     action_payload: Value,
 }
 
