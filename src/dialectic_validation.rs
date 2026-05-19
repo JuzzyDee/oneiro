@@ -128,4 +128,24 @@ mod tests {
         assert!(err.contains("unknown action"));
         assert!(err.contains("forget"));
     }
+
+    // worker_dialectic.rs now tolerant-deserialises a missing action_payload
+    // to Value::Null. These tests lock in the gate behaviour for that case.
+
+    #[test]
+    fn keep_accepts_null_payload() {
+        assert!(validate_synthesis_payload("keep", &Value::Null).is_ok());
+    }
+
+    #[test]
+    fn reframe_rejects_null_payload() {
+        let err = validate_synthesis_payload("reframe", &Value::Null).unwrap_err();
+        assert!(err.contains("new_content"));
+    }
+
+    #[test]
+    fn flag_rejects_null_payload() {
+        let err = validate_synthesis_payload("flag", &Value::Null).unwrap_err();
+        assert!(err.contains("note"));
+    }
 }
