@@ -58,6 +58,46 @@ For embedded systems with no UI, use a service API key as a plain `Authorization
 
 Drag `oneiro-skill/oneiro-skill.zip` into Claude.ai → Settings → Skills. This loads progressive-disclosure usage guidance — when to remember, when to reframe, when to let go — so Claude develops calibrated memory habits across instances. Without the skill the tools still work, but instances may diverge on what's worth keeping.
 
+### Install the orient hook (Claude Code only)
+
+The skill tells Claude *when* to call `recall_orient`. The orient hook makes orientation arrive *before* Claude evaluates whether to call any tool — closing the bootstrap-failure window where instances default to the system prompt's built-in memory and never look at Oneiro.
+
+Two steps. First, configure auth + URL. Pick one:
+
+**Option A — macOS keychain (recommended; no env leakage)**
+
+```bash
+security add-generic-password -s "oneiro-orient" -a "$USER" -w "<your service api key>"
+export ONEIRO_WORKER_URL="https://oneiro.<your-subdomain>.workers.dev"  # add to ~/.zshrc
+```
+
+**Option B — environment variable only**
+
+```bash
+export ONEIRO_ORIENT_TOKEN="<your service api key>"
+export ONEIRO_WORKER_URL="https://oneiro.<your-subdomain>.workers.dev"
+# add both to ~/.zshrc so Claude Code inherits them
+```
+
+Then wire the SessionStart and PreCompact hooks in `~/.claude/settings.json`. Point them at the script in this repo (or copy it somewhere stable):
+
+```jsonc
+{
+  "hooks": {
+    "SessionStart": [{
+      "matcher": "",
+      "hooks": [{ "type": "command", "command": "/absolute/path/to/oneiro/scripts/oneiro-orient.sh" }]
+    }],
+    "PreCompact": [{
+      "matcher": "",
+      "hooks": [{ "type": "command", "command": "/absolute/path/to/oneiro/scripts/oneiro-orient.sh" }]
+    }]
+  }
+}
+```
+
+Fail-safe by design: if the worker is unreachable, auth is missing, or anything else goes wrong, the script exits 0 with no output and the session continues normally. A misconfigured hook will never break a session — it'll just silently not inject orientation.
+
 ### Verifying Oneiro is running
 
 ```bash
