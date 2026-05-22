@@ -10,16 +10,16 @@
 //   1. Vectorize.query(embedding) → top-k memory_ids
 //   2. SELECT … FROM memories WHERE id IN (?, ?, …)
 //
-// Phase 2b.1 (this commit) implements the minimum viable set:
+// Phase 2b.1 implemented the minimum viable set:
 //
 //   create_memory_with_provenance — INSERT a memory row
 //   get                            — SELECT one by id
-//   recall_active                  — SELECT top-k by strength
 //
 // Embedding generation (Workers AI) and Vectorize integration land in
 // CLA-84 phases 3 + 4. Subsequent commits add `find_neighbours`,
-// `recall_semantic`, `touch`, `forget`, `consolidate`, `reframe`,
-// `record_co_activation`, `apply_decay`, and the image-handling paths.
+// `touch`, `forget`, `consolidate`, `reframe`, `record_co_activation`,
+// `apply_decay`, and the image-handling paths. CLA-103 retired
+// `recall_active` (was only used by the now-removed `review` tool).
 
 use crate::memory::{Memory, MemoryType};
 use chrono::{DateTime, Utc};
@@ -172,32 +172,6 @@ pub async fn get(db: &D1Database, id: &str) -> Result<Option<Memory>> {
     Ok(row.map(MemoryRow::into_memory))
 }
 
-/// Top-k active memories by strength. Filters out orientation memories
-/// (those load via a separate `get_orientation` path) so they don't
-/// crowd the active set.
-pub async fn recall_active(
-    db: &D1Database,
-    min_strength: f64,
-    limit: usize,
-) -> Result<Vec<Memory>> {
-    let rows: Vec<MemoryRow> = db
-        .prepare(
-            "SELECT id, memory_type, content, summary, created_at, last_accessed,
-                    access_count, strength, stability, entity, tags, image_hash,
-                    image_mime, recorded_by
-             FROM memories
-             WHERE strength >= ?
-               AND memory_type != 'orientation'
-             ORDER BY strength DESC
-             LIMIT ?",
-        )
-        .bind(&[min_strength.into(), (limit as u32).into()])?
-        .all()
-        .await?
-        .results()?;
-    Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
-}
-
 /// INSERT a memory record verbatim — preserves the caller's id,
 /// timestamps, strength, all fields exactly. Used by /admin/import
 /// during data migration (CLA-84 phase 8) so the migrated rows keep
@@ -312,6 +286,30 @@ pub async fn get_orientation(db: &D1Database) -> Result<Vec<Memory>> {
              ORDER BY created_at ASC",
         )
         .bind(&[])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// N most recently created episodic memories. Used by `recall_orient`
+/// (CLA-103) as the "what's been happening lately" half of the
+/// conversation-start payload. Ordered by `created_at DESC` rather than
+/// `last_accessed DESC` — the intent is chronological-recent ("what
+/// happened recently") rather than salience-recent ("what's hot right
+/// now"); the salience case is served by `recall_check`.
+pub async fn get_recent_episodics(db: &D1Database, limit: usize) -> Result<Vec<Memory>> {
+    let rows: Vec<MemoryRow> = db
+        .prepare(
+            "SELECT id, memory_type, content, summary, created_at, last_accessed,
+                    access_count, strength, stability, entity, tags, image_hash,
+                    image_mime, recorded_by
+             FROM memories
+             WHERE memory_type = 'episodic'
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(&[(limit as u32).into()])?
         .all()
         .await?
         .results()?;

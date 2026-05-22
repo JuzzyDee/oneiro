@@ -29,13 +29,14 @@ tokio::task_local! {
     pub static AUTH_CTX: AuthCtx;
 }
 
-/// Read tools — for rate-limit bucketing.
+/// Read tools — for rate-limit bucketing. Updated CLA-103: `recall`
+/// retired in favour of `recall_orient`; `review` retired from MCP and
+/// moved to a direct worker_store call by the dialectic.
 const READ_TOOLS: &[&str] = &[
-    "recall",
+    "recall_orient",
     "recall_check",
     "recall_specific",
     "recall_image",
-    "review",
 ];
 /// Write tools — separate (smaller) rate budget.
 const WRITE_TOOLS: &[&str] = &["remember", "remember_with_image"];

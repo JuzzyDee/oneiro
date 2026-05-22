@@ -18,7 +18,6 @@ mod key_rate;
 mod memory;
 
 // Worker-side modules (wasm32-only).
-mod worker_admin;
 mod worker_audit;
 mod worker_auth_ctx;
 mod worker_dialectic;
@@ -28,6 +27,7 @@ mod worker_embed;
 mod worker_mcp;
 mod worker_mmr;
 mod worker_oauth;
+mod worker_orient;
 mod worker_rem;
 mod worker_rem_audit;
 mod worker_store;
@@ -56,10 +56,13 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // OAuth bearer tokens and service API keys.
         (Method::Post, "/mcp") => mcp_endpoint(&env, &mut req).await,
 
-        // Admin import — verbatim memory write for the data migration
-        // (CLA-84 phase 8) and future disaster-recovery flows. Auth via
-        // ONEIRO_ADMIN_KEY secret, NOT the per-role service-key allowlist.
-        (Method::Post, "/admin/import") => worker_admin::handle_import(&env, &mut req).await,
+        // Orientation — plain-text orientation payload for the
+        // SessionStart/PreCompact hook (CLA-105) to inject before any
+        // tool evaluation fires. Authed via service API key OR OAuth
+        // bearer — same validator as /mcp. Read-only, no scope check
+        // beyond "valid bearer" — orientation memories are pinned and
+        // identity-bearing, suitable for any authenticated caller.
+        (Method::Get, "/orientation") => orientation_endpoint(&env, &req).await,
 
         // OAuth 2.1 — Authorization Code + Client Credentials grants.
         (Method::Get, "/.well-known/oauth-protected-resource") => {
@@ -98,6 +101,41 @@ async fn mcp_endpoint(env: &Env, req: &mut Request) -> Result<Response> {
 
     let body = req.text().await?;
     worker_mcp::handle(env, &body, auth).await
+}
+
+/// GET /orientation — plain-text orientation payload for the
+/// SessionStart/PreCompact hook (CLA-105). Returns the same orientation
+/// block that `recall_orient` would surface, formatted for direct
+/// injection as system context. No recent episodics — orientation only,
+/// because the hook fires automatically (potentially many times per
+/// session) and surfacing episodics there would inflate access counts
+/// and pollute the Hebbian co-activation signal with non-conscious
+/// surfacing noise. The model can call `recall_orient` deliberately if
+/// it wants the recent half too.
+async fn orientation_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    if worker_auth_ctx::validate_bearer(env, &bearer).await.is_none() {
+        return Response::error("Invalid or unknown bearer token", 401);
+    }
+
+    let db = env.d1("DB")?;
+    let orientation = worker_store::get_orientation(&db).await.map_err(|e| {
+        worker::Error::RustError(format!("get_orientation: {:?}", e))
+    })?;
+    let counts = worker_store::count_by_type(&db).await.unwrap_or((0, 0, 0));
+    let payload = worker_orient::format_payload(&orientation, None, counts);
+
+    let mut resp = Response::ok(payload)?;
+    resp.headers_mut()
+        .set("content-type", "text/plain; charset=utf-8")?;
+    Ok(resp)
 }
 
 /// GET /authorize — renders the consent HTML page. Query params:

@@ -54,19 +54,23 @@ impl Role {
     /// reframe, forget, or reflect — the worst they can do is read existing
     /// memories and add new ones (which the audit trail captures).
     ///
-    /// The `rover` allowlist (CLA-86 §3):
-    ///   reads:  recall, recall_check, recall_specific, recall_image, review
+    /// The `rover` allowlist (CLA-86 §3, updated CLA-103):
+    ///   reads:  recall_orient, recall_check, recall_specific, recall_image
     ///   writes: remember, remember_with_image  (entity forced server-side
     ///                                           to "rover" in phase 4)
+    ///
+    /// `recall` and `review` retired in CLA-103. `recall` was replaced by
+    /// `recall_orient` (orientation + N recent, no semantic guess at t=0).
+    /// `review` was only ever for the dialectic, which calls into
+    /// worker_store directly without going through the MCP layer.
     pub fn allows(&self, tool: &str) -> bool {
         match self {
             Role::Rover => matches!(
                 tool,
-                "recall"
+                "recall_orient"
                     | "recall_check"
                     | "recall_specific"
                     | "recall_image"
-                    | "review"
                     | "remember"
                     | "remember_with_image"
             ),

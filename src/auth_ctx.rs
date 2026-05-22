@@ -217,12 +217,11 @@ mod tests {
         };
         AUTH_CTX
             .scope(ctx, async {
-                // Allowed
-                assert!(check_scope("recall").is_ok());
+                // Allowed (CLA-103: recall→recall_orient, review retired)
+                assert!(check_scope("recall_orient").is_ok());
                 assert!(check_scope("recall_check").is_ok());
                 assert!(check_scope("recall_specific").is_ok());
                 assert!(check_scope("recall_image").is_ok());
-                assert!(check_scope("review").is_ok());
                 assert!(check_scope("remember").is_ok());
                 assert!(check_scope("remember_with_image").is_ok());
 
@@ -230,6 +229,10 @@ mod tests {
                 assert!(check_scope("reframe").is_err());
                 assert!(check_scope("forget").is_err());
                 assert!(check_scope("reflect").is_err());
+
+                // Retired in CLA-103 — now reject as unknown tools.
+                assert!(check_scope("recall").is_err());
+                assert!(check_scope("review").is_err());
 
                 // Unknown tools default to forbidden (matches!(tool, "...") returns false)
                 assert!(check_scope("admin_dump_all").is_err());
