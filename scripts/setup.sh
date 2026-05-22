@@ -363,15 +363,29 @@ if [ "$ENABLE_R2" = "y" ]; then
     if [ "$DRY_RUN" = true ]; then
         dim "[dry-run] wrangler r2 bucket create oneiro-images"
     else
+        # Three outcomes worth distinguishing: success (proceed), bucket
+        # already exists (proceed, harmless re-run), real failure (stop).
+        # Treating every non-zero as "already exists" was the bug — billing
+        # not enabled would silently uncomment the binding and surface as a
+        # confusing wrangler deploy error two steps later.
         if R2_OUT=$(wrangler r2 bucket create oneiro-images 2>&1); then
             printf '%s\n' "$R2_OUT" | tail -3
-        else
-            warn "R2 bucket create returned non-zero (likely already exists):"
+        elif printf '%s' "$R2_OUT" | grep -qiE 'already exists|bucketalreadyexists'; then
+            warn "R2 bucket 'oneiro-images' already exists; reusing it."
             printf '%s\n' "$R2_OUT" | tail -3 | sed 's/^/    /'
+        else
+            err "R2 bucket create failed:"
+            printf '%s\n' "$R2_OUT" | sed 's/^/    /'
+            say ""
+            err "Common causes: billing not enabled on the Cloudflare account,"
+            err "or insufficient R2 permissions on the API token. Re-run setup.sh"
+            err "and decline R2 if you want a billing-free deploy."
+            exit 1
         fi
-        # The example ships the [[r2_buckets]] block commented out — uncomment
-        # it now so wrangler deploy picks up the binding. Idempotent: re-running
-        # setup.sh with R2 already enabled is a no-op for this awk.
+        # Either created or already-exists: enable the binding. The example
+        # ships [[r2_buckets]] commented out so wrangler deploy ignores it on
+        # a no-R2 deploy. Idempotent: a second run with R2 already enabled
+        # is a no-op (the `# ` prefix lines won't match).
         awk '
             /^# \[\[r2_buckets\]\]$/         { print "[[r2_buckets]]"; next }
             /^# binding = "IMAGES"$/         { print "binding = \"IMAGES\""; next }
