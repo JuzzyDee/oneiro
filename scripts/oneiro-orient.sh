@@ -34,17 +34,21 @@ WORKER_URL="${ONEIRO_WORKER_URL:-}"
 [ -z "$WORKER_URL" ] && exit 0
 
 # 2. Auth token — env first (explicit), then macOS keychain (preferred for
-#    persistence without exposing to process listings).
+#    persistence without exposing to process listings). The keychain lookup
+#    pins the account to $USER so an entry from a different login user (or
+#    a stale unrelated `oneiro-orient` entry) can't shadow the right one.
 TOKEN="${ONEIRO_ORIENT_TOKEN:-}"
 if [ -z "$TOKEN" ] && command -v security >/dev/null 2>&1; then
-    TOKEN=$(security find-generic-password -s "oneiro-orient" -w 2>/dev/null || true)
+    TOKEN=$(security find-generic-password -s "oneiro-orient" -a "$USER" -w 2>/dev/null || true)
 fi
 [ -z "$TOKEN" ] && exit 0
 
 # 3. Fetch. `--fail` makes curl return non-zero on HTTP >= 400 so the
 #    `||` handles auth/server errors as silent no-ops. `--max-time` so
-#    a slow worker can't stall session startup indefinitely.
-curl --silent --fail --show-error --max-time 10 \
+#    a slow worker can't stall session startup indefinitely. stderr is
+#    swallowed deliberately (the failure semantics are silent no-op),
+#    so `--show-error` would be a no-op and is omitted.
+curl --silent --fail --max-time 10 \
     --header "Authorization: Bearer ${TOKEN}" \
     "${WORKER_URL%/}/orientation" 2>/dev/null \
     || exit 0

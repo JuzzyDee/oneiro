@@ -58,11 +58,35 @@ For embedded systems with no UI, use a service API key as a plain `Authorization
 
 Drag `oneiro-skill/oneiro-skill.zip` into Claude.ai → Settings → Skills. This loads progressive-disclosure usage guidance — when to remember, when to reframe, when to let go — so Claude develops calibrated memory habits across instances. Without the skill the tools still work, but instances may diverge on what's worth keeping.
 
+### Generating a service API key
+
+The orient hook (and any other non-interactive caller — rover, custom agent, automation) authenticates with a service API key, not OAuth. OAuth is for interactive clients (Claude Code, Claude.ai) that go through a consent flow; service keys are for headless callers that need to authenticate without a human in the loop.
+
+To mint one, from the repo root:
+
+```bash
+cargo run --bin oneiro -- keygen --role rover
+```
+
+The command prints two things to stderr:
+
+- **Raw key** (format `mk_<role>_<32 random chars>`) — what the client uses as the Bearer token. Paste into the caller's storage: macOS keychain, the rover's `.env` as `ONEIRO_MCP_TOKEN`, etc. Shown once; not recoverable.
+- **Hash entry** (`rover:$argon2id$v=19$...`) — what the worker stores. Append to `ONEIRO_API_KEYS` so the worker can verify incoming bearer tokens.
+
+To update the worker's secret:
+
+```bash
+wrangler secret put ONEIRO_API_KEYS
+# paste: existing-entry-1;existing-entry-2;rover:$argon2id$v=19$...
+```
+
+Note `wrangler secret put` overwrites — combine with any existing entries you want to keep, semicolons between. Multiple `rover:` hashes can coexist; each is argon2-verified independently against incoming tokens, so you can issue a dedicated key per caller (orient hook, rover, etc.) and rotate them independently.
+
 ### Install the orient hook (Claude Code only)
 
 The skill tells Claude *when* to call `recall_orient`. The orient hook makes orientation arrive *before* Claude evaluates whether to call any tool — closing the bootstrap-failure window where instances default to the system prompt's built-in memory and never look at Oneiro.
 
-Two steps. First, configure auth + URL. Pick one:
+Two steps. First, configure auth + URL with the service key you minted above. Pick one:
 
 **Option A — macOS keychain (recommended; no env leakage)**
 
