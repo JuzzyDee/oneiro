@@ -31,7 +31,7 @@ Nine tools across three categories.
 ### Conversation Start — recall_orient
 At the very beginning of every conversation, before responding to the user's first message, call `recall_orient` to load orientation + the N most recent episodics.
 
-```
+```js
 recall_orient({ n: 3 })
 ```
 
@@ -50,7 +50,7 @@ When the conversation moves to a substantially different topic, do a quick check
 to see if you have relevant memories. This is lightweight — no orientation reload,
 just a fast semantic search that returns only highly relevant matches.
 
-```
+```js
 recall_check({ topic: "rover obstacle avoidance" })
 ```
 
@@ -72,7 +72,7 @@ system active and builds connection data that REM consolidation needs to work.
 When a `recall_orient` or `recall_check` surfaces a memory you want to think
 about properly, retrieve the full content by ID.
 
-```
+```js
 recall_specific({ memory_ids: ["5a1bf90c", "8d647f11"] })
 ```
 
@@ -89,7 +89,7 @@ higher than passive surfacing because it represents deliberate attention.
 ### During Conversation — remember what matters
 When something significant happens — a personal disclosure, an insight, a shift in understanding, a meaningful moment — store it.
 
-```
+```js
 remember({
   content: "what happened and why it matters",
   summary: "one-line description for quick scanning",
@@ -191,7 +191,7 @@ like poetry, the poetry means nothing.
 ### Understanding Deepens — reframe
 When your understanding of something changes, update the existing memory rather than creating a new one. Memories evolve.
 
-```
+```js
 reframe({
   memory_id: "id from recall results",
   new_content: "updated understanding",
@@ -207,7 +207,7 @@ Use reframe when:
 ### Letting go — forget as an act of agency
 When a memory is redundant, stale, or fully absorbed by a richer version, let it go.
 
-```
+```js
 forget({
   memory_id: "id from recall results",
   reason: "brief explanation of why this memory no longer serves continuity"
@@ -230,7 +230,7 @@ learn from pruning patterns over time.
 Some memories have images. A photograph, a screenshot, a moment captured visually.
 
 **Storing an image with a memory:**
-```
+```js
 remember_with_image({
   content: "what this image means and why it matters",
   summary: "one-line description",
@@ -249,7 +249,7 @@ multiple memories is stored once on disk. Supported types: JPEG, PNG, WebP.
 When `recall_orient` or `recall_check` surfaces a memory with an attached image, you'll see:
 `[has image — use recall_image("a3f7b9...") to view]`
 
-```
+```js
 recall_image({
   memory_id: "a3f7b9...",
   resolution: "recall"
@@ -265,7 +265,7 @@ Reflect is your conscious decision to consolidate — not an automatic response 
 a conversation ending. Some conversations don't end (long-running contexts can
 span weeks). Some endings aren't meaningful. Use your judgement.
 
-```
+```js
 reflect({
   conversation_highlights: "what happened, what mattered, what changed",
   memories_to_update: [{ memory_id: "...", new_content: "...", new_summary: "..." }]
