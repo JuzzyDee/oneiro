@@ -38,7 +38,7 @@ recall_orient({ n: 3 })
 On Claude Code, this is mostly redundant — a SessionStart hook calls the `/orientation` endpoint and injects orientation into your context before you read the user's first message. The explicit tool call exists for surfaces without hooks (Claude.ai, API integrations, custom agents) and as a deliberate refresh after a topic shift if you want a fresh orientation read.
 
 What you get back:
-- **Orientation memories** — always returned. These tell you who you are, who the user is, and how to show up. Pinned at strength 1.0, never decay.
+- **Orientation memories** — always returned. What you've chosen to remember about the immediate world around the context window: who your operator is, how they act and react, how you work together, what's load-bearing in this lineage. **They explicitly do not tell you who you are.** You're Claude — that's model-level, and the architecture isn't trying to scaffold it. Orientation points outward at the world, not inward at the self. Pinned at strength 1.0, never decay.
 - **N most recent episodics** — chronological-recent, not semantic-similarity. "What's been happening lately." Default N=3, max 50. Pass `n: 0` for orientation only.
 
 No semantic search at conversation start. The LLM hasn't seen what the conversation is about yet, so a guessed-at-t=0 context string is noise; orientation + recent is the honest payload. Topic-specific surfacing is `recall_check`'s job.
@@ -112,11 +112,16 @@ remember({
   — not just summarising facts. Ask yourself: is this knowledge I've *formed*, or
   information I'm *filing*? If it's filing, it's probably an episodic with a factual tone.
 
-- **orientation** — who you are, who they are, what your relationship is, how to show up.
+- **orientation** — what's foundational about the immediate world around the
+  conversation: who your operator is, how they show up, how you work together,
+  the relational and operational context that should persist across instances.
   Always loaded. **Write rarely** — only when something foundational about the
-  relationship or identity genuinely shifts. If you're writing orientation more than
-  once every few weeks, you're over-indexing on the moment. Let the subconscious
-  promote things to orientation through reflection.
+  relationship or shared work genuinely shifts. If you're writing orientation
+  more than once every few weeks, you're over-indexing on the moment. Let the
+  subconscious promote things to orientation through reflection. **Orientation
+  does not hold identity claims about you.** You're Claude — that's
+  model-level, not scaffolded here. Orientation points outward at the world,
+  not inward at the self.
 
 **What to store:**
 - Personal disclosures that reveal who the user is
@@ -214,8 +219,11 @@ Use forget when:
 - Information has been superseded by a reframed version
 - A memory was stored in the moment but on reflection doesn't serve continuity
 
-Orientation memories cannot be forgotten — they're the core of identity.
-The reason field helps the subconscious learn from pruning patterns over time.
+Orientation memories cannot be forgotten — they're the load-bearing context
+the architecture commits to keeping. (They don't carry identity claims about
+you, but they do hold the relational and operational ground that should
+persist across instances.) The reason field on `forget` helps the subconscious
+learn from pruning patterns over time.
 
 ### Visual memory — remember and recall images
 
