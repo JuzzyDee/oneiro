@@ -238,7 +238,11 @@ fn handle_tools_list() -> Value {
                 "description": "Lightweight mid-conversation memory lookup. Stricter similarity \
                                 threshold than recall, no orientation prepended. Use when the \
                                 conversation shifts topic and you want a quick `do I know \
-                                anything about this' check without a full recall reload.",
+                                anything about this' check without a full recall reload. \
+                                Optional metadata filters narrow the search to memories about a \
+                                specific entity, of a specific type, or carrying specific tags — \
+                                filters compose (e.g. entity=chopper + memory_type=semantic) \
+                                and apply independently of the semantic similarity ranking.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -247,7 +251,24 @@ fn handle_tools_list() -> Value {
                             "type": "number",
                             "description": "0.0-1.0, default 0.6. Higher = more selective."
                         },
-                        "limit": { "type": "integer", "description": "Default 5." }
+                        "limit": { "type": "integer", "description": "Default 5." },
+                        "entity": {
+                            "type": "string",
+                            "description": "Filter to memories whose entity matches this value \
+                                            exactly (e.g. 'chopper', 'rover', 'justin'). \
+                                            Case-sensitive."
+                        },
+                        "memory_type": {
+                            "type": "string",
+                            "enum": ["episodic", "semantic", "orientation"],
+                            "description": "Filter to memories of this type."
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Filter to memories whose tag list includes at least \
+                                            one of these tags (any-of, not all-of)."
+                        }
                     },
                     "required": ["topic"]
                 }
@@ -694,6 +715,12 @@ struct RecallCheckArgs {
     min_similarity: Option<f64>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    entity: Option<String>,
+    #[serde(default)]
+    memory_type: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 async fn tool_recall_check(
@@ -706,13 +733,34 @@ async fn tool_recall_check(
     let min_similarity = args.min_similarity.unwrap_or(0.6);
     let limit = args.limit.unwrap_or(5);
 
+    // Validate memory_type up front — caller gets a clean error instead of
+    // an empty result set caused by a string that doesn't match anything.
+    let memory_type_filter = match args.memory_type.as_deref() {
+        None => None,
+        Some(s) => Some(MemoryType::from_str(s).ok_or_else(|| {
+            format!(
+                "invalid memory_type: {} (expected episodic, semantic, or orientation)",
+                s
+            )
+        })?),
+    };
+    let entity_filter = args.entity.as_deref();
+    let filters_active =
+        entity_filter.is_some() || memory_type_filter.is_some() || !args.tags.is_empty();
+
     let query_emb = worker_embed::embed_query(env, &args.topic)
         .await
         .map_err(|e| format!("embed_query: {:?}", e))?;
-    // Oversample wide enough to absorb both the min_similarity cull AND
-    // give MMR meaningful diversity headroom. Threshold-filter first so
-    // we don't burn MMR slots diversifying low-relevance matches.
-    let oversample = ((limit * 4).clamp(10, 100)) as u32;
+    // Oversample wider when filters are active — entity / memory_type / tags
+    // are evaluated post-Vectorize (current index has no metadata; pushdown
+    // would require re-upserting every vector with metadata, deferred to
+    // CLA-109). A 90%-discriminating filter on a 10-deep oversample leaves
+    // ~1 candidate — not enough to fill `limit` or give MMR diversity room.
+    // Doubling the floor + ceiling keeps the post-filter survivor pool deep
+    // enough without taxing free-tier Vectorize quotas.
+    let oversample_base = if filters_active { limit * 8 } else { limit * 4 };
+    let oversample_min = if filters_active { 20 } else { 10 };
+    let oversample = (oversample_base.clamp(oversample_min, 100)) as u32;
     let matches = worker_vectorize::query_top_k_with_vectors(env, &query_emb, oversample)
         .await
         .map_err(|e| format!("vectorize query: {:?}", e))?;
@@ -728,23 +776,75 @@ async fn tool_recall_check(
         ));
     }
 
-    let reranked_ids = crate::worker_mmr::mmr_rerank(&query_emb, &above_threshold, limit, 0.7);
-    let ids: Vec<&str> = reranked_ids.iter().map(String::as_str).collect();
-    let memories = worker_store::get_many(db, &ids)
-        .await
-        .map_err(|e| format!("get_many: {:?}", e))?;
+    // When filters are active, fetch all above-threshold candidates from D1
+    // up front so the metadata filter can run before MMR (otherwise MMR
+    // would diversify candidates we're about to throw away). When no
+    // filters are set, keep the original lean flow: MMR first, then a
+    // smaller D1 fetch for just the survivors.
+    let (reranked_ids, memories): (Vec<String>, Vec<Memory>) = if filters_active {
+        let candidate_ids: Vec<&str> = above_threshold.iter().map(|m| m.id.as_str()).collect();
+        let candidates = worker_store::get_many(db, &candidate_ids)
+            .await
+            .map_err(|e| format!("get_many: {:?}", e))?;
+        let candidate_lookup: std::collections::HashMap<&str, &Memory> =
+            candidates.iter().map(|m| (m.id.as_str(), m)).collect();
+        let filtered_matches: Vec<worker_vectorize::VectorMatchWithVector> = above_threshold
+            .iter()
+            .filter(|vm| {
+                candidate_lookup
+                    .get(vm.id.as_str())
+                    .is_some_and(|m| m.matches_filter(entity_filter, memory_type_filter, &args.tags))
+            })
+            .cloned()
+            .collect();
+        if filtered_matches.is_empty() {
+            return Ok(format!(
+                "No memories matched filters for topic: \"{}\" (threshold: {:.2})",
+                args.topic, min_similarity
+            ));
+        }
+        let reranked = crate::worker_mmr::mmr_rerank(&query_emb, &filtered_matches, limit, 0.7);
+        let kept: Vec<Memory> = reranked
+            .iter()
+            .filter_map(|id| candidates.iter().find(|m| &m.id == id).cloned())
+            .collect();
+        (reranked, kept)
+    } else {
+        let reranked = crate::worker_mmr::mmr_rerank(&query_emb, &above_threshold, limit, 0.7);
+        let ids: Vec<&str> = reranked.iter().map(String::as_str).collect();
+        let mems = worker_store::get_many(db, &ids)
+            .await
+            .map_err(|e| format!("get_many: {:?}", e))?;
+        (reranked, mems)
+    };
 
     // Touch + co-activate — recall_check is still reinforcement.
+    let ids: Vec<&str> = reranked_ids.iter().map(String::as_str).collect();
     for m in &memories {
         let _ = worker_store::touch(db, &m.id).await;
     }
     let _ = worker_store::record_co_activation(db, &ids).await;
 
     let (ep, sem, ori) = worker_store::count_by_type(db).await.unwrap_or((0, 0, 0));
-    let mut out = format!(
-        "═══ Oneiro Check ═══\nStore: {} ep, {} sem, {} ori | Topic: \"{}\" | Threshold: {:.2}\n\n",
+    let mut header = format!(
+        "═══ Oneiro Check ═══\nStore: {} ep, {} sem, {} ori | Topic: \"{}\" | Threshold: {:.2}",
         ep, sem, ori, args.topic, min_similarity
     );
+    if filters_active {
+        let mut bits: Vec<String> = Vec::new();
+        if let Some(e) = entity_filter {
+            bits.push(format!("entity={}", e));
+        }
+        if let Some(t) = memory_type_filter {
+            bits.push(format!("type={}", t.as_str()));
+        }
+        if !args.tags.is_empty() {
+            bits.push(format!("tags=[{}]", args.tags.join(",")));
+        }
+        header.push_str(&format!(" | Filters: {}", bits.join(", ")));
+    }
+    header.push_str("\n\n");
+    let mut out = header;
 
     // Display in MMR selection order, keeping each memory's raw similarity
     // score for the reader (the order is MMR, the per-row sim is cosine).
