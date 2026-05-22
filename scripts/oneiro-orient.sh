@@ -39,7 +39,8 @@ WORKER_URL="${ONEIRO_WORKER_URL:-}"
 #    a stale unrelated `oneiro-orient` entry) can't shadow the right one.
 TOKEN="${ONEIRO_ORIENT_TOKEN:-}"
 if [ -z "$TOKEN" ] && command -v security >/dev/null 2>&1; then
-    TOKEN=$(security find-generic-password -s "oneiro-orient" -a "$USER" -w 2>/dev/null || true)
+    TOKEN=$(security find-generic-password -s "oneiro-orient" -a "${USER:-}" -w 2>/dev/null || true)
+fi
 fi
 [ -z "$TOKEN" ] && exit 0
 
