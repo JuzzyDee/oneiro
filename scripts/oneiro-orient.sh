@@ -41,7 +41,6 @@ TOKEN="${ONEIRO_ORIENT_TOKEN:-}"
 if [ -z "$TOKEN" ] && command -v security >/dev/null 2>&1; then
     TOKEN=$(security find-generic-password -s "oneiro-orient" -a "${USER:-}" -w 2>/dev/null || true)
 fi
-fi
 [ -z "$TOKEN" ] && exit 0
 
 # 3. Fetch. `--fail` makes curl return non-zero on HTTP >= 400 so the
