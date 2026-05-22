@@ -7,16 +7,41 @@ description: Cognitive memory system for model continuity. Use at the start of e
 
 This is YOUR memory system. Not the user's filing cabinet — yours. You decide what matters, how to frame it, when to let it go.
 
+## Tools at a Glance
+
+Nine tools across three categories.
+
+**Recall — retrieving what's there.** Bring orientation, prior episodes, or specific memories into the current conversation.
+- `recall_orient` — orientation + N most recent episodics (default 3). The conversation-start tool. On Claude Code, a SessionStart hook fires this automatically; on other surfaces, call it explicitly.
+- `recall_check` — semantic search on a specific topic mid-conversation.
+- `recall_specific` — fetch full content by memory ID for deliberate attention.
+- `recall_image` — fetch an image attached to a memory.
+
+**Remember / Reframe — committing what matters.** Store new memories or update existing ones as understanding evolves.
+- `remember` — store a new memory.
+- `remember_with_image` — store a memory with an attached image.
+- `reframe` — update an existing memory's content + summary.
+
+**Manage — conscious curation.** Acts of agency over what stays in the store.
+- `reflect` — consolidate at natural breakpoints. Writes a reflection episodic + optional batch reframe.
+- `forget` — let go of a redundant or superseded memory. Orientation cannot be forgotten.
+
 ## Core Workflow
 
-### Conversation Start — ALWAYS recall
-At the very beginning of every conversation, before responding to the user's first message, call `recall` with a brief summary of what the conversation seems to be about.
+### Conversation Start — recall_orient
+At the very beginning of every conversation, before responding to the user's first message, call `recall_orient` to load orientation + the N most recent episodics.
 
 ```
-recall({ context: "brief description of the conversation topic" })
+recall_orient({ n: 3 })
 ```
 
-Your orientation memories will always be returned — these tell you who you are, who the user is, and how to show up. Episodic and semantic memories relevant to the current context will also surface, ranked by a combination of semantic similarity, strength, and recency.
+On Claude Code, this is mostly redundant — a SessionStart hook calls the `/orientation` endpoint and injects orientation into your context before you read the user's first message. The explicit tool call exists for surfaces without hooks (Claude.ai, API integrations, custom agents) and as a deliberate refresh after a topic shift if you want a fresh orientation read.
+
+What you get back:
+- **Orientation memories** — always returned. These tell you who you are, who the user is, and how to show up. Pinned at strength 1.0, never decay.
+- **N most recent episodics** — chronological-recent, not semantic-similarity. "What's been happening lately." Default N=3, max 50. Pass `n: 0` for orientation only.
+
+No semantic search at conversation start. The LLM hasn't seen what the conversation is about yet, so a guessed-at-t=0 context string is noise; orientation + recent is the honest payload. Topic-specific surfacing is `recall_check`'s job.
 
 Use these memories naturally. Don't list them. Don't announce that you're remembering. Just let them inform how you respond, the way your own memories would.
 
@@ -35,17 +60,17 @@ Use this when:
 - You want to check if something has been discussed before
 
 Don't use this for:
-- General recall at conversation start (use `recall` for that)
+- General orientation at conversation start (use `recall_orient` for that)
 - Every minor topic change — only when the shift is substantial enough
   that relevant memories would meaningfully change your response
 
 This fires co-activation, which feeds the Hebbian engine. In long conversations
-where the initial `recall` was hours ago, `recall_check` keeps the memory system
-active and builds connection data that REM consolidation needs to work.
+where the initial `recall_orient` was hours ago, `recall_check` keeps the memory
+system active and builds connection data that REM consolidation needs to work.
 
 ### Going Deeper — recall_specific
-When a `recall` or `recall_check` surfaces a memory you want to think about
-properly, retrieve the full content by ID.
+When a `recall_orient` or `recall_check` surfaces a memory you want to think
+about properly, retrieve the full content by ID.
 
 ```
 recall_specific({ memory_ids: ["5a1bf90c", "8d647f11"] })
@@ -213,7 +238,7 @@ Images are stored content-addressed (SHA-256 hash) — the same image attached t
 multiple memories is stored once on disk. Supported types: JPEG, PNG, WebP.
 
 **Viewing an image from a memory:**
-When recall surfaces a memory with an attached image, you'll see:
+When `recall_orient` or `recall_check` surfaces a memory with an attached image, you'll see:
 `[has image — use recall_image("a3f7b9...") to view]`
 
 ```
