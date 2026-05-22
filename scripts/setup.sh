@@ -258,6 +258,25 @@ fi
 
 header "[2/8] Creating Cloudflare resources"
 
+# Image storage (R2) — optional. R2 is the only stack component that
+# requires Cloudflare billing to be enabled on the account, even within
+# the 10GB free tier. Free-tier deployers can decline this and still
+# get a fully working memory system; only image features (the rover
+# camera heartbeat, photo memories) need R2.
+say ""
+say "  ${BOLD}Image storage (R2) — optional${RESET}"
+dim "    Image features (remember_with_image, recall_image, rover camera"
+dim "    heartbeats) need a Cloudflare R2 bucket. R2 requires CF billing"
+dim "    enabled on your account, even within its 10GB free tier."
+dim "    Decline if you're on a billing-free CF account — every non-image"
+dim "    feature still works."
+say ""
+prompt ENABLE_R2 "Enable image storage? [y/N]" "n"
+case "$ENABLE_R2" in
+    y|Y|yes|YES) ENABLE_R2="y" ;;
+    *)           ENABLE_R2="n" ;;
+esac
+
 # D1
 say "  Creating D1 database 'oneiro-db'..."
 if [ "$DRY_RUN" = true ]; then
@@ -336,19 +355,50 @@ else
 fi
 ok "KV namespace: ONEIRO_VERSION_CACHE (id: ${VERSION_KV_ID})"
 
-# R2
-say "  Creating R2 bucket 'oneiro-images'..."
-if [ "$DRY_RUN" = true ]; then
-    dim "[dry-run] wrangler r2 bucket create oneiro-images"
-else
-    if R2_OUT=$(wrangler r2 bucket create oneiro-images 2>&1); then
-        printf '%s\n' "$R2_OUT" | tail -3
+# R2 — only when the operator opted in above. Skipped builds get no
+# IMAGES binding and the worker hides remember_with_image / recall_image
+# from the MCP tools listing at runtime.
+if [ "$ENABLE_R2" = "y" ]; then
+    say "  Creating R2 bucket 'oneiro-images'..."
+    if [ "$DRY_RUN" = true ]; then
+        dim "[dry-run] wrangler r2 bucket create oneiro-images"
     else
-        warn "R2 bucket create returned non-zero (likely already exists):"
-        printf '%s\n' "$R2_OUT" | tail -3 | sed 's/^/    /'
+        # Three outcomes worth distinguishing: success (proceed), bucket
+        # already exists (proceed, harmless re-run), real failure (stop).
+        # Treating every non-zero as "already exists" was the bug — billing
+        # not enabled would silently uncomment the binding and surface as a
+        # confusing wrangler deploy error two steps later.
+        if R2_OUT=$(wrangler r2 bucket create oneiro-images 2>&1); then
+            printf '%s\n' "$R2_OUT" | tail -3
+        elif printf '%s' "$R2_OUT" | grep -qiE 'already exists|bucketalreadyexists'; then
+            warn "R2 bucket 'oneiro-images' already exists; reusing it."
+            printf '%s\n' "$R2_OUT" | tail -3 | sed 's/^/    /'
+        else
+            err "R2 bucket create failed:"
+            printf '%s\n' "$R2_OUT" | sed 's/^/    /'
+            say ""
+            err "Common causes: billing not enabled on the Cloudflare account,"
+            err "or insufficient R2 permissions on the API token. Re-run setup.sh"
+            err "and decline R2 if you want a billing-free deploy."
+            exit 1
+        fi
+        # Either created or already-exists: enable the binding. The example
+        # ships [[r2_buckets]] commented out so wrangler deploy ignores it on
+        # a no-R2 deploy. Idempotent: a second run with R2 already enabled
+        # is a no-op (the `# ` prefix lines won't match).
+        awk '
+            /^# \[\[r2_buckets\]\]$/         { print "[[r2_buckets]]"; next }
+            /^# binding = "IMAGES"$/         { print "binding = \"IMAGES\""; next }
+            /^# bucket_name = "oneiro-images"$/ { print "bucket_name = \"oneiro-images\""; next }
+            { print }
+        ' wrangler.toml > wrangler.toml.r2tmp && mv wrangler.toml.r2tmp wrangler.toml
     fi
+    ok "R2 bucket: oneiro-images (binding enabled in wrangler.toml)"
+else
+    dim "  Skipping R2 — image features will be disabled in this deploy."
+    dim "  To enable later: uncomment [[r2_buckets]] in wrangler.toml,"
+    dim "  run 'wrangler r2 bucket create oneiro-images', then redeploy."
 fi
-ok "R2 bucket: oneiro-images"
 
 # Patch wrangler.toml with the new IDs.
 if [ "$DRY_RUN" = true ]; then
@@ -454,7 +504,6 @@ header "[4/8] Generating credentials"
 
 CLIENT_ID="oneiro-$(openssl rand -hex 4)"
 CLIENT_SECRET=$(openssl rand -hex 32)
-ADMIN_KEY=$(openssl rand -hex 32)
 
 cat <<EOF
 
@@ -463,13 +512,52 @@ cat <<EOF
 
   ${BOLD}ONEIRO_OAUTH_CLIENT_ID:${RESET}     ${CLIENT_ID}
   ${BOLD}ONEIRO_OAUTH_CLIENT_SECRET:${RESET} ${CLIENT_SECRET}
-  ${BOLD}ONEIRO_ADMIN_KEY:${RESET}           ${ADMIN_KEY}
 
 EOF
 prompt SAVED "Saved these? Type 'yes' to continue"
 if [ "$SAVED" != "yes" ] && [ "$SAVED" != "YES" ] && [ "$SAVED" != "y" ]; then
     err "Setup aborted. Re-run when ready to save the credentials."
     exit 1
+fi
+
+# Optional starter service API key. Service keys let non-interactive
+# callers (orient hook, rover, custom scripts) authenticate without an
+# OAuth dance. The keygen subcommand is always available later via
+# `cargo run --bin oneiro -- keygen --role <role>`; this just folds the
+# first-key path into setup so the orient hook works out of the box.
+say ""
+say "  ${BOLD}Starter service API key — optional${RESET}"
+dim "    A service key lets the orient hook, the rover, or any other"
+dim "    non-interactive client authenticate against Oneiro without"
+dim "    OAuth. You can mint one now or skip and generate later via"
+dim "    'cargo run --bin oneiro -- keygen --role rover'."
+say ""
+prompt MAKE_API_KEY "Generate a starter rover service key now? [y/N]" "n"
+case "$MAKE_API_KEY" in
+    y|Y|yes|YES) MAKE_API_KEY="y" ;;
+    *)           MAKE_API_KEY="n" ;;
+esac
+
+RAW_API_KEY=""
+API_KEY_ENTRY=""
+if [ "$MAKE_API_KEY" = "y" ]; then
+    if [ "$DRY_RUN" = true ]; then
+        dim "[dry-run] cargo run --bin oneiro -- keygen --role rover --quiet"
+        RAW_API_KEY="mk_rover_dryrunplaceholderrawkeyvalue00"
+        API_KEY_ENTRY="rover:\$argon2id\$v=19\$m=19456,t=2,p=1\$dryrunsaltvalue\$dryrunhashvalue"
+        ok "Service key (dry-run synthetic)"
+    else
+        say "  Building keygen binary (cargo run, first invocation may compile)..."
+        if KEYGEN_OUT=$(cargo run --quiet --bin oneiro -- keygen --role rover --quiet 2>/dev/null); then
+            RAW_API_KEY=$(printf '%s\n' "$KEYGEN_OUT" | sed -n '1p')
+            API_KEY_ENTRY=$(printf '%s\n' "$KEYGEN_OUT" | sed -n '2p')
+        fi
+        if [ -z "$RAW_API_KEY" ] || [ -z "$API_KEY_ENTRY" ]; then
+            err "keygen produced no output — check 'cargo run --bin oneiro -- keygen --role rover'"
+            exit 1
+        fi
+        ok "Service key generated (role: rover) — raw key shown in final summary"
+    fi
 fi
 
 # ──── Step 5: Claude Code OAuth token ────────────────────────────────
@@ -516,10 +604,13 @@ push_secret "ONEIRO_OAUTH_CLIENT_ID" "$CLIENT_ID"
 ok "ONEIRO_OAUTH_CLIENT_ID"
 push_secret "ONEIRO_OAUTH_CLIENT_SECRET" "$CLIENT_SECRET"
 ok "ONEIRO_OAUTH_CLIENT_SECRET"
-push_secret "ONEIRO_ADMIN_KEY" "$ADMIN_KEY"
-ok "ONEIRO_ADMIN_KEY"
 push_secret "CLAUDE_CODE_OAUTH_TOKEN" "$OAUTH_TOKEN"
 ok "CLAUDE_CODE_OAUTH_TOKEN"
+
+if [ -n "$API_KEY_ENTRY" ]; then
+    push_secret "ONEIRO_API_KEYS" "$API_KEY_ENTRY"
+    ok "ONEIRO_API_KEYS (rover service key hash)"
+fi
 
 # Stage 3 dispatcher mode. The worker defaults to dry_run when this is
 # missing — that's a fail-safe for in-place operator deploys (burn-in
@@ -568,6 +659,33 @@ fi
 ok "Deployed: ${WORKER_URL}"
 
 # ──── Final summary ──────────────────────────────────────────────────
+
+# Service key — surfaced AFTER deploy succeeds so the hash on the worker
+# matches the raw value we're about to print. Shown first because it's
+# unrecoverable from the stored hash; the operator must capture it now.
+if [ -n "$RAW_API_KEY" ]; then
+    cat <<EOF
+
+${BOLD}${YELLOW}============================================================
+  ⚠  STARTER SERVICE KEY — STORE THIS NOW
+============================================================${RESET}
+
+  ${BOLD}Role:${RESET}    rover
+  ${BOLD}Raw key:${RESET}
+
+    ${BOLD}${RAW_API_KEY}${RESET}
+
+  ${YELLOW}The hash is on the worker; the raw key cannot be recovered.${RESET}
+  ${YELLOW}Save it to a password manager / .env now.${RESET}
+
+  ${BOLD}Common uses${RESET}
+    Orient hook (macOS keychain):
+      ${DIM}security add-generic-password -s "oneiro-orient" -a "\$USER" -w '<paste raw key>'${RESET}
+    Rover .env / any non-interactive client:
+      ${DIM}ONEIRO_MCP_TOKEN=<paste raw key>${RESET}
+
+EOF
+fi
 
 cat <<EOF
 

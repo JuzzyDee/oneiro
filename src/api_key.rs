@@ -267,6 +267,15 @@ pub fn print_generated_key(key: &GeneratedKey) {
     eprintln!();
 }
 
+/// Print a newly-generated key to stdout in machine-parseable form: two
+/// lines, raw key first then env entry. Used by setup.sh to capture both
+/// values deterministically. Caller still owns the "store this now"
+/// responsibility — quiet mode just changes the output shape.
+pub fn print_generated_key_quiet(key: &GeneratedKey) {
+    println!("{}", key.raw);
+    println!("{}", key.env_entry());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
