@@ -21,12 +21,16 @@ use std::path::PathBuf;
 /// Tools the rover role may invoke (read side). Used by check_scope to
 /// classify a call for rate-limit bucketing — reads draw from a larger
 /// budget than writes.
+///
+/// Updated CLA-103: `recall` retired in favour of `recall_orient`;
+/// `review` retired from MCP and moved to a direct worker_store call by
+/// the dialectic. Keep in sync with the wasm mirror in
+/// `worker_auth_ctx::READ_TOOLS`.
 const READ_TOOLS: &[&str] = &[
-    "recall",
+    "recall_orient",
     "recall_check",
     "recall_specific",
     "recall_image",
-    "review",
 ];
 
 /// Tools the rover role may invoke (write side).

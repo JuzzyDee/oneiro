@@ -143,7 +143,9 @@ fn handle_tools_list() -> Value {
                         "n": {
                             "type": "integer",
                             "description": "Number of most-recent episodic memories to \
-                                            include (default 3). Pass 0 for orientation only."
+                                            include (default 3, max 50). Pass 0 for \
+                                            orientation only. Values above the max are \
+                                            clamped server-side."
                         }
                     }
                 }
@@ -430,13 +432,20 @@ struct RecallOrientArgs {
     n: Option<usize>,
 }
 
+/// Maximum number of recent episodics `recall_orient` will return,
+/// regardless of caller request. Bounds payload size + D1 read cost —
+/// the entry-point tool should be fast and small. Anything beyond this
+/// is a "browse the store" job and belongs in `review`-style tooling.
+const MAX_RECALL_ORIENT_N: usize = 50;
+
 /// recall_orient — the conversation-start tool (CLA-103). Returns all
-/// orientation memories plus N most recent episodics (default N=3).
-/// No embed, no Vectorize, no MMR. The work that makes this payload
-/// good already happened upstream during reflect/dialectic passes;
-/// here we just surface it. Conscious-call semantics: touches
-/// surfaced memories (Hebbian reinforcement) and co-activates the
-/// recents (they were surfaced together).
+/// orientation memories plus N most recent episodics (default N=3,
+/// clamped to MAX_RECALL_ORIENT_N). No embed, no Vectorize, no MMR.
+/// The work that makes this payload good already happened upstream
+/// during reflect/dialectic passes; here we just surface it.
+/// Conscious-call semantics: touches surfaced memories (Hebbian
+/// reinforcement) and co-activates the recents (they were surfaced
+/// together).
 async fn tool_recall_orient(
     env: &Env,
     db: &D1Database,
@@ -444,7 +453,7 @@ async fn tool_recall_orient(
 ) -> std::result::Result<String, String> {
     let args: RecallOrientArgs = serde_json::from_value(args)
         .map_err(|e| format!("invalid recall_orient args: {}", e))?;
-    let n = args.n.unwrap_or(3);
+    let n = args.n.unwrap_or(3).min(MAX_RECALL_ORIENT_N);
 
     let orientation = worker_store::get_orientation(db)
         .await
