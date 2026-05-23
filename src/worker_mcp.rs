@@ -981,11 +981,13 @@ async fn tool_recall_check(
     for id in &reranked_ids {
         if let Some(m) = memories.iter().find(|m| &m.id == id) {
             let sim = id_to_score.get(m.id.as_str()).copied().unwrap_or(0.0);
+            let img = if m.image_hash.is_some() { " | img" } else { "" };
             out.push_str(&format!(
-                "[sim:{:.2} | str:{:.2} | {}]\n{}\n",
+                "[sim:{:.2} | str:{:.2} | {}{}]\n{}\n",
                 sim,
                 m.strength,
                 &m.id[..8],
+                img,
                 m.summary
             ));
         }

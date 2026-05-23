@@ -101,8 +101,14 @@ pub(crate) fn format_memory(m: &Memory) -> String {
         .as_deref()
         .map(|s| format!(" via:{}", s))
         .unwrap_or_default();
+    // Image indicator — terse so it doesn't bloat the header. The reader
+    // sees `img` and knows recall_image will succeed against this id.
+    // Without it: the "I came home excited about a photo" workflow
+    // forces speculative recall_image calls to discover which candidate
+    // carries the bytes.
+    let img = if m.image_hash.is_some() { " | img" } else { "" };
     format!(
-        "[{} | {} | str:{:.2} | {} | id:{}{}{}]\n{}\n",
+        "[{} | {} | str:{:.2} | {} | id:{}{}{}{}]\n{}\n",
         type_label,
         age_str,
         m.strength,
@@ -110,6 +116,7 @@ pub(crate) fn format_memory(m: &Memory) -> String {
         &m.id[..8],
         tags_str,
         by,
+        img,
         m.content
     )
 }
