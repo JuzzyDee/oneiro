@@ -108,3 +108,128 @@ pub struct Memory {
     ///   None     — pre-CLA-86 legacy memory, or a local stdio write
     pub recorded_by: Option<String>,
 }
+
+impl Memory {
+    /// True if this memory satisfies every active recall_check filter
+    /// (CLA-108). Each argument is independently optional / empty:
+    ///
+    /// * `entity` — if `Some`, the memory's entity must equal it exactly
+    ///   (case-sensitive). `None` skips the entity check.
+    /// * `memory_type` — if `Some`, the memory's type must equal it.
+    /// * `tags` — if non-empty, at least one of the listed tags must
+    ///   appear in the memory's tag list (any-of, not all-of).
+    ///
+    /// The empty filter (all None / empty) passes every memory — so the
+    /// no-filter path through recall_check is numerically identical to
+    /// pre-CLA-108 behaviour. Filters compose with AND semantics across
+    /// fields, OR semantics within the tag list.
+    pub fn matches_filter(
+        &self,
+        entity: Option<&str>,
+        memory_type: Option<MemoryType>,
+        tags: &[String],
+    ) -> bool {
+        if let Some(want) = entity {
+            if self.entity.as_deref() != Some(want) {
+                return false;
+            }
+        }
+        if let Some(want) = memory_type {
+            if self.memory_type != want {
+                return false;
+            }
+        }
+        if !tags.is_empty() {
+            let any_match = tags
+                .iter()
+                .any(|wanted| self.tags.iter().any(|have| have == wanted));
+            if !any_match {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem(entity: Option<&str>, memory_type: MemoryType, tags: &[&str]) -> Memory {
+        Memory {
+            id: "test".to_string(),
+            memory_type,
+            content: String::new(),
+            summary: String::new(),
+            created_at: Utc::now(),
+            last_accessed: Utc::now(),
+            access_count: 0,
+            strength: 1.0,
+            stability: 1.0,
+            entity: entity.map(str::to_string),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            embedding: None,
+            image_hash: None,
+            image_mime: None,
+            recorded_by: None,
+        }
+    }
+
+    #[test]
+    fn empty_filter_passes_everything() {
+        let m = mem(Some("chopper"), MemoryType::Episodic, &["walk", "morning"]);
+        assert!(m.matches_filter(None, None, &[]));
+    }
+
+    #[test]
+    fn entity_filter_exact_match() {
+        let m = mem(Some("chopper"), MemoryType::Episodic, &[]);
+        assert!(m.matches_filter(Some("chopper"), None, &[]));
+        assert!(!m.matches_filter(Some("rover"), None, &[]));
+    }
+
+    #[test]
+    fn entity_filter_rejects_when_memory_entity_is_none() {
+        let m = mem(None, MemoryType::Episodic, &[]);
+        assert!(!m.matches_filter(Some("chopper"), None, &[]));
+    }
+
+    #[test]
+    fn memory_type_filter() {
+        let m = mem(None, MemoryType::Semantic, &[]);
+        assert!(m.matches_filter(None, Some(MemoryType::Semantic), &[]));
+        assert!(!m.matches_filter(None, Some(MemoryType::Episodic), &[]));
+    }
+
+    #[test]
+    fn tags_any_of() {
+        let m = mem(None, MemoryType::Episodic, &["walk", "morning"]);
+        assert!(m.matches_filter(None, None, &["walk".to_string()]));
+        assert!(m.matches_filter(None, None, &["walk".to_string(), "absent".to_string()]));
+        assert!(!m.matches_filter(None, None, &["evening".to_string()]));
+    }
+
+    #[test]
+    fn tags_empty_skip_check() {
+        // Empty tags arg means "don't filter by tags" — even a memory with
+        // no tags should pass.
+        let m = mem(None, MemoryType::Episodic, &[]);
+        assert!(m.matches_filter(None, None, &[]));
+    }
+
+    #[test]
+    fn filters_compose_with_and_semantics() {
+        let m = mem(Some("chopper"), MemoryType::Episodic, &["walk"]);
+        assert!(m.matches_filter(
+            Some("chopper"),
+            Some(MemoryType::Episodic),
+            &["walk".to_string()]
+        ));
+        // One mismatch breaks the conjunction.
+        assert!(!m.matches_filter(
+            Some("chopper"),
+            Some(MemoryType::Semantic),
+            &["walk".to_string()]
+        ));
+    }
+}
