@@ -99,7 +99,7 @@ async fn dispatch(env: &Env, req: &JsonRpcRequest) -> std::result::Result<Value,
     match req.method.as_str() {
         "initialize" => Ok(handle_initialize()),
         "notifications/initialized" => Ok(Value::Null),
-        "tools/list" => Ok(handle_tools_list()),
+        "tools/list" => Ok(handle_tools_list(env)),
         "tools/call" => handle_tools_call(env, req).await.map_err(|e| {
             rpc_err(id, INTERNAL_ERROR, format!("Tool dispatch failed: {}", e))
         }),
@@ -124,8 +124,18 @@ fn handle_initialize() -> Value {
     })
 }
 
-fn handle_tools_list() -> Value {
-    json!({
+/// Image tools (remember_with_image, recall_image) need an R2 bucket
+/// binding. R2 is the one stack component that requires CF billing, so
+/// deploys without it skip the binding — and we hide the tools from the
+/// MCP listing rather than advertising features that can't work. A model
+/// that somehow still calls them gets a clean error from the handlers
+/// below.
+fn images_available(env: &Env) -> bool {
+    env.bucket("IMAGES").is_ok()
+}
+
+fn handle_tools_list(env: &Env) -> Value {
+    let mut listing = json!({
         "tools": [
             {
                 "name": "recall_orient",
@@ -185,52 +195,6 @@ fn handle_tools_list() -> Value {
                         }
                     },
                     "required": ["content", "summary", "memory_type"]
-                }
-            },
-            {
-                "name": "remember_with_image",
-                "description": "Store a memory with an attached image. The image bytes (base64) \
-                                are content-addressed into R2 — duplicate uploads of the same \
-                                image are deduplicated automatically. Used primarily by the \
-                                rover heartbeat to record observations with the current camera \
-                                frame.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "content": { "type": "string" },
-                        "summary": { "type": "string" },
-                        "memory_type": {
-                            "type": "string",
-                            "enum": ["episodic", "semantic", "orientation"]
-                        },
-                        "entity": { "type": "string" },
-                        "tags": { "type": "array", "items": { "type": "string" } },
-                        "image_base64": {
-                            "type": "string",
-                            "description": "Base64-encoded image bytes (no data: URI prefix)."
-                        },
-                        "image_mime": {
-                            "type": "string",
-                            "description": "MIME type — image/jpeg, image/png, or image/webp."
-                        }
-                    },
-                    "required": ["content", "summary", "memory_type", "image_base64", "image_mime"]
-                }
-            },
-            {
-                "name": "recall_image",
-                "description": "Retrieve an image attached to a memory. Takes the memory's id \
-                                (full UUID or the 8-char prefix shown in recall output). Returns \
-                                MCP content with the memory's summary text and the image bytes.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "memory_id": {
-                            "type": "string",
-                            "description": "Full UUID or 8-char prefix from a prior recall."
-                        }
-                    },
-                    "required": ["memory_id"]
                 }
             },
             {
@@ -356,7 +320,63 @@ fn handle_tools_list() -> Value {
                 }
             }
         ]
-    })
+    });
+
+    if images_available(env) {
+        if let Some(arr) = listing
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+        {
+            arr.push(json!({
+                "name": "remember_with_image",
+                "description": "Store a memory with an attached image. The image bytes (base64) \
+                                are content-addressed into R2 — duplicate uploads of the same \
+                                image are deduplicated automatically. Used primarily by the \
+                                rover heartbeat to record observations with the current camera \
+                                frame.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string" },
+                        "summary": { "type": "string" },
+                        "memory_type": {
+                            "type": "string",
+                            "enum": ["episodic", "semantic", "orientation"]
+                        },
+                        "entity": { "type": "string" },
+                        "tags": { "type": "array", "items": { "type": "string" } },
+                        "image_base64": {
+                            "type": "string",
+                            "description": "Base64-encoded image bytes (no data: URI prefix)."
+                        },
+                        "image_mime": {
+                            "type": "string",
+                            "description": "MIME type — image/jpeg, image/png, or image/webp."
+                        }
+                    },
+                    "required": ["content", "summary", "memory_type", "image_base64", "image_mime"]
+                }
+            }));
+            arr.push(json!({
+                "name": "recall_image",
+                "description": "Retrieve an image attached to a memory. Takes the memory's id \
+                                (full UUID or the 8-char prefix shown in recall output). Returns \
+                                MCP content with the memory's summary text and the image bytes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {
+                            "type": "string",
+                            "description": "Full UUID or 8-char prefix from a prior recall."
+                        }
+                    },
+                    "required": ["memory_id"]
+                }
+            }));
+        }
+    }
+
+    listing
 }
 
 async fn handle_tools_call(
@@ -606,9 +626,12 @@ async fn tool_remember_with_image(
         .decode(args.image_base64.as_bytes())
         .map_err(|e| format!("invalid base64 image: {}", e))?;
 
-    let bucket = env
-        .bucket("IMAGES")
-        .map_err(|e| format!("IMAGES bucket binding: {:?}", e))?;
+    let bucket = env.bucket("IMAGES").map_err(|_| {
+        "Image storage is not configured on this deployment. The IMAGES \
+         R2 binding is absent — remember_with_image and recall_image are \
+         disabled. Use `remember` (without an image) instead, or enable \
+         R2 in wrangler.toml and redeploy.".to_string()
+    })?;
 
     let recorded_by = worker_auth_ctx::current_recorded_by();
 
@@ -673,9 +696,11 @@ async fn tool_recall_image(
     };
     let mime = memory.image_mime.as_deref().unwrap_or("image/jpeg");
 
-    let bucket = env
-        .bucket("IMAGES")
-        .map_err(|e| format!("IMAGES bucket binding: {:?}", e))?;
+    let bucket = env.bucket("IMAGES").map_err(|_| {
+        "Image storage is not configured on this deployment. The IMAGES \
+         R2 binding is absent — recall_image cannot retrieve attached \
+         images. Enable R2 in wrangler.toml and redeploy to access them.".to_string()
+    })?;
     let bytes = worker_store::read_image_from_r2(&bucket, hash, mime)
         .await
         .map_err(|e| format!("read_image: {:?}", e))?
