@@ -330,6 +330,11 @@ pub async fn fts_search(
     match_expr: &str,
     limit: u32,
 ) -> Result<Vec<String>> {
+    // Trim defensively: build_fts_query (our only current caller) can't
+    // produce whitespace-only output, but fts_search is pub and a future
+    // caller might. A whitespace-only MATCH expression would error on
+    // FTS5's syntax check rather than degenerating cleanly to empty.
+    let match_expr = match_expr.trim();
     if match_expr.is_empty() {
         return Ok(Vec::new());
     }
