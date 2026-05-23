@@ -316,6 +316,41 @@ pub async fn get_recent_episodics(db: &D1Database, limit: usize) -> Result<Vec<M
     Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
 }
 
+/// BM25-ranked full-text search via the memories_fts virtual table
+/// (CLA-109). Returns memory IDs in rank order (best match first). The
+/// caller passes a pre-built FTS5 MATCH expression — use
+/// `crate::hybrid::build_fts_query` to construct one safely from user
+/// free-text. An empty / None query short-circuits (caller skips FTS).
+///
+/// BM25 is FTS5's default ranking function; we don't expose the raw
+/// score because RRF fusion uses rank, not score. Returning ids in
+/// order is the contract.
+pub async fn fts_search(
+    db: &D1Database,
+    match_expr: &str,
+    limit: u32,
+) -> Result<Vec<String>> {
+    if match_expr.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[derive(serde::Deserialize)]
+    struct FtsHit {
+        id: String,
+    }
+    let rows: Vec<FtsHit> = db
+        .prepare(
+            "SELECT id FROM memories_fts
+             WHERE memories_fts MATCH ?
+             ORDER BY rank
+             LIMIT ?",
+        )
+        .bind(&[match_expr.into(), limit.into()])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
+}
+
 /// Memories filtered by entity, ranked by strength.
 pub async fn recall_by_entity(
     db: &D1Database,

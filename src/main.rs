@@ -23,6 +23,7 @@ mod auth_ctx;
 #[allow(dead_code)]
 mod dialectic_validation;
 mod embed;
+mod hybrid;
 mod key_rate;
 mod memory;
 mod store;
