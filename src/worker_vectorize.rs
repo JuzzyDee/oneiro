@@ -44,6 +44,15 @@ extern "C" {
     /// deleteByIds(ids: string[]) → Promise<VectorizeAsyncMutation>
     #[wasm_bindgen(method, js_name = "deleteByIds", catch)]
     fn delete_by_ids(this: &VectorizeIndex, ids: JsValue) -> Result<Promise, JsValue>;
+
+    /// getByIds(ids: string[]) → Promise<VectorizeVector[]>
+    /// Returns each id's stored vector (no score — there's no query to
+    /// score against). Used by hybrid retrieval (CLA-109) to fetch
+    /// vectors for ids that FTS surfaced but Vectorize's top-K query
+    /// didn't include — so those candidates can still participate in
+    /// MMR diversity ranking.
+    #[wasm_bindgen(method, js_name = "getByIds", catch)]
+    fn get_by_ids(this: &VectorizeIndex, ids: JsValue) -> Result<Promise, JsValue>;
 }
 
 impl EnvBinding for VectorizeIndex {
@@ -88,6 +97,15 @@ struct QueryResponse {
 struct QueryResponseWithVectors {
     #[serde(default)]
     matches: Vec<VectorMatchWithVector>,
+}
+
+/// getByIds returns bare `{id, values}` objects — no score (there was no
+/// query). Used by hybrid retrieval to pull vectors for FTS-only hits.
+#[derive(Debug, Deserialize)]
+pub struct StoredVector {
+    pub id: String,
+    #[serde(default)]
+    pub values: Vec<f64>,
 }
 
 fn from_env(env: &Env, binding_name: &str) -> Result<VectorizeIndex> {
@@ -174,4 +192,26 @@ pub async fn query_top_k_with_vectors(
     let response: QueryResponseWithVectors = serde_wasm_bindgen::from_value(result)
         .map_err(|e| Error::JsError(format!("Vectorize response parse failed: {}", e)))?;
     Ok(response.matches)
+}
+
+/// Fetch stored vectors by id — no query, no scoring, just a lookup.
+/// Used by hybrid retrieval (CLA-109): when FTS surfaces an id that
+/// wasn't in Vectorize's top-K, we still want it to participate in MMR
+/// diversity ranking, which needs the vector.
+///
+/// Ids not present in the index are silently dropped from the returned
+/// list (Cloudflare's behaviour, not ours). Caller should not assume
+/// the response length matches the request length.
+pub async fn get_by_ids(env: &Env, ids: &[&str]) -> Result<Vec<StoredVector>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let index = from_env(env, "VECTORS")?;
+    let ids_arr: Array = ids.iter().map(|s| JsValue::from_str(s)).collect();
+    let promise = index.get_by_ids(ids_arr.into()).map_err(js_err)?;
+    let result = JsFuture::from(promise).await.map_err(js_err)?;
+    // getByIds returns a bare array, not a `{matches: [...]}` envelope.
+    let vectors: Vec<StoredVector> = serde_wasm_bindgen::from_value(result)
+        .map_err(|e| Error::JsError(format!("Vectorize getByIds parse failed: {}", e)))?;
+    Ok(vectors)
 }

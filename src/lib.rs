@@ -14,6 +14,7 @@ mod api_key;
 mod audit;
 mod dialectic_validation;
 mod embed;
+mod hybrid;
 mod key_rate;
 mod memory;
 

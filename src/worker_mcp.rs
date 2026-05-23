@@ -14,6 +14,7 @@
 // recall_specific, review, reframe, forget, reflect, remember_with_image)
 // and the OAuth path for non-rover callers.
 
+use crate::hybrid::{self, DEFAULT_RRF_K};
 use crate::memory::{Memory, MemoryType};
 use crate::worker_auth_ctx::{self, AuthCtx};
 use crate::worker_orient::format_memory;
@@ -748,6 +749,24 @@ struct RecallCheckArgs {
     tags: Vec<String>,
 }
 
+/// Read `ONEIRO_HYBRID_FTS_WEIGHT` from worker env (CLA-109). Default
+/// 1.0 (equal weighting with vector). Set to 0.0 to disable the FTS
+/// leg entirely (semantic-only — pre-CLA-109 behaviour). Tunable knob
+/// for A/B without redeploying schema changes.
+fn read_fts_weight(env: &Env) -> f64 {
+    let raw = match env.var("ONEIRO_HYBRID_FTS_WEIGHT") {
+        Ok(v) => v.to_string(),
+        Err(_) => return 1.0,
+    };
+    raw.parse::<f64>().unwrap_or_else(|_| {
+        worker::console_error!(
+            "ONEIRO_HYBRID_FTS_WEIGHT={:?} unparseable; using default 1.0",
+            raw
+        );
+        1.0
+    })
+}
+
 async fn tool_recall_check(
     env: &Env,
     db: &D1Database,
@@ -773,26 +792,73 @@ async fn tool_recall_check(
     let filters_active =
         entity_filter.is_some() || memory_type_filter.is_some() || !args.tags.is_empty();
 
+    let fts_weight = read_fts_weight(env);
+    let hybrid_active = fts_weight > 0.0;
+
     let query_emb = worker_embed::embed_query(env, &args.topic)
         .await
         .map_err(|e| format!("embed_query: {:?}", e))?;
     // Oversample wider when filters are active — entity / memory_type / tags
-    // are evaluated post-Vectorize (current index has no metadata; pushdown
-    // would require re-upserting every vector with metadata, deferred to
-    // CLA-109). A 90%-discriminating filter on a 10-deep oversample leaves
-    // ~1 candidate — not enough to fill `limit` or give MMR diversity room.
-    // Doubling the floor + ceiling keeps the post-filter survivor pool deep
-    // enough without taxing free-tier Vectorize quotas.
+    // filter post-Vectorize (no metadata pushdown in the index, would
+    // require re-upserting every vector with metadata). Hybrid is
+    // similarly post-fusion. A 90%-discriminating filter on a 10-deep
+    // oversample leaves ~1 candidate — not enough to fill `limit` or
+    // feed MMR. Doubling the floor + ceiling keeps the post-filter
+    // survivor pool deep enough without taxing free-tier quotas.
     let oversample_base = if filters_active { limit * 8 } else { limit * 4 };
     let oversample_min = if filters_active { 20 } else { 10 };
     let oversample = (oversample_base.clamp(oversample_min, 100)) as u32;
-    let matches = worker_vectorize::query_top_k_with_vectors(env, &query_emb, oversample)
+
+    // ── Vector leg ────────────────────────────────────────────────
+    let vector_matches = worker_vectorize::query_top_k_with_vectors(env, &query_emb, oversample)
         .await
         .map_err(|e| format!("vectorize query: {:?}", e))?;
-    let above_threshold: Vec<worker_vectorize::VectorMatchWithVector> = matches
+    let mut above_threshold: Vec<worker_vectorize::VectorMatchWithVector> = vector_matches
         .into_iter()
         .filter(|m| m.score >= min_similarity)
         .collect();
+    let vector_ranking: Vec<String> = above_threshold.iter().map(|m| m.id.clone()).collect();
+
+    // ── FTS leg (skipped if weight == 0) ──────────────────────────
+    let fts_ranking: Vec<String> = if hybrid_active {
+        match hybrid::build_fts_query(&args.topic) {
+            Some(expr) => worker_store::fts_search(db, &expr, oversample)
+                .await
+                .map_err(|e| format!("fts_search: {:?}", e))?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // ── Bridge: FTS-only hits get their vectors via getByIds so they ──
+    //    can participate in cosine threshold + MMR diversity. Without
+    //    this, lexical-only hits would be invisible to MMR.
+    let vector_id_set: std::collections::HashSet<&str> =
+        above_threshold.iter().map(|m| m.id.as_str()).collect();
+    let fts_only_ids: Vec<&str> = fts_ranking
+        .iter()
+        .filter(|id| !vector_id_set.contains(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !fts_only_ids.is_empty() {
+        let fetched = worker_vectorize::get_by_ids(env, &fts_only_ids)
+            .await
+            .map_err(|e| format!("vectorize get_by_ids: {:?}", e))?;
+        for sv in fetched {
+            if sv.values.is_empty() {
+                continue;
+            }
+            let score = hybrid::cosine_similarity(&query_emb, &sv.values);
+            if score >= min_similarity {
+                above_threshold.push(worker_vectorize::VectorMatchWithVector {
+                    id: sv.id,
+                    score,
+                    values: sv.values,
+                });
+            }
+        }
+    }
 
     if above_threshold.is_empty() {
         return Ok(format!(
@@ -801,26 +867,62 @@ async fn tool_recall_check(
         ));
     }
 
-    // When filters are active, fetch all above-threshold candidates from D1
-    // up front so the metadata filter can run before MMR (otherwise MMR
-    // would diversify candidates we're about to throw away). When no
-    // filters are set, keep the original lean flow: MMR first, then a
-    // smaller D1 fetch for just the survivors.
+    // Capture id → cosine_score for display BEFORE we consume pool into
+    // the rerank/filter pipeline below. Used to render per-row `sim:`
+    // values to the reader.
+    let id_to_score: std::collections::HashMap<String, f64> = above_threshold
+        .iter()
+        .map(|m| (m.id.clone(), m.score))
+        .collect();
+
+    // ── Fuse rankings → narrow candidate pool to fused top-(limit*3) ──
+    //    RRF determines which candidates compete; MMR diversifies within
+    //    that subset. The narrowing is what gives fusion influence over
+    //    the final ranking — without it, MMR's cosine-relevance metric
+    //    would dominate and FTS contribution would be wasted.
+    let pool: Vec<worker_vectorize::VectorMatchWithVector> = if hybrid_active
+        && !fts_ranking.is_empty()
+    {
+        let fused = hybrid::rrf_fuse(&fts_ranking, &vector_ranking, fts_weight, DEFAULT_RRF_K);
+        let narrow_to = (limit * 3).max(limit).min(above_threshold.len());
+        let kept_ids: std::collections::HashSet<&str> = fused
+            .iter()
+            .take(narrow_to)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        // Reorder above_threshold by fused-rank position so MMR's first
+        // candidate (the highest-cosine in pool) at least comes from the
+        // top of the fused list when ties or near-ties exist.
+        let fused_pos: std::collections::HashMap<&str, usize> = fused
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.as_str(), i))
+            .collect();
+        let mut kept: Vec<worker_vectorize::VectorMatchWithVector> = above_threshold
+            .into_iter()
+            .filter(|m| kept_ids.contains(m.id.as_str()))
+            .collect();
+        kept.sort_by_key(|m| fused_pos.get(m.id.as_str()).copied().unwrap_or(usize::MAX));
+        kept
+    } else {
+        above_threshold
+    };
+
+    // ── CLA-108 metadata filters + MMR rerank ─────────────────────
     let (reranked_ids, memories): (Vec<String>, Vec<Memory>) = if filters_active {
-        let candidate_ids: Vec<&str> = above_threshold.iter().map(|m| m.id.as_str()).collect();
+        let candidate_ids: Vec<&str> = pool.iter().map(|m| m.id.as_str()).collect();
         let candidates = worker_store::get_many(db, &candidate_ids)
             .await
             .map_err(|e| format!("get_many: {:?}", e))?;
         let candidate_lookup: std::collections::HashMap<&str, &Memory> =
             candidates.iter().map(|m| (m.id.as_str(), m)).collect();
-        let filtered_matches: Vec<worker_vectorize::VectorMatchWithVector> = above_threshold
-            .iter()
+        let filtered_matches: Vec<worker_vectorize::VectorMatchWithVector> = pool
+            .into_iter()
             .filter(|vm| {
                 candidate_lookup
                     .get(vm.id.as_str())
                     .is_some_and(|m| m.matches_filter(entity_filter, memory_type_filter, &args.tags))
             })
-            .cloned()
             .collect();
         if filtered_matches.is_empty() {
             return Ok(format!(
@@ -835,7 +937,7 @@ async fn tool_recall_check(
             .collect();
         (reranked, kept)
     } else {
-        let reranked = crate::worker_mmr::mmr_rerank(&query_emb, &above_threshold, limit, 0.7);
+        let reranked = crate::worker_mmr::mmr_rerank(&query_emb, &pool, limit, 0.7);
         let ids: Vec<&str> = reranked.iter().map(String::as_str).collect();
         let mems = worker_store::get_many(db, &ids)
             .await
@@ -855,6 +957,9 @@ async fn tool_recall_check(
         "═══ Oneiro Check ═══\nStore: {} ep, {} sem, {} ori | Topic: \"{}\" | Threshold: {:.2}",
         ep, sem, ori, args.topic, min_similarity
     );
+    if hybrid_active {
+        header.push_str(&format!(" | Hybrid: fts_w={:.1}", fts_weight));
+    }
     if filters_active {
         let mut bits: Vec<String> = Vec::new();
         if let Some(e) = entity_filter {
@@ -873,18 +978,16 @@ async fn tool_recall_check(
 
     // Display in MMR selection order, keeping each memory's raw similarity
     // score for the reader (the order is MMR, the per-row sim is cosine).
-    let id_to_score: std::collections::HashMap<&str, f64> = above_threshold
-        .iter()
-        .map(|m| (m.id.as_str(), m.score))
-        .collect();
     for id in &reranked_ids {
         if let Some(m) = memories.iter().find(|m| &m.id == id) {
             let sim = id_to_score.get(m.id.as_str()).copied().unwrap_or(0.0);
+            let img = if m.image_hash.is_some() { " | img" } else { "" };
             out.push_str(&format!(
-                "[sim:{:.2} | str:{:.2} | {}]\n{}\n",
+                "[sim:{:.2} | str:{:.2} | {}{}]\n{}\n",
                 sim,
                 m.strength,
                 &m.id[..8],
+                img,
                 m.summary
             ));
         }

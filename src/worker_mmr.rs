@@ -26,27 +26,8 @@
 
 #![cfg(target_family = "wasm")]
 
+use crate::hybrid::cosine_similarity;
 use crate::worker_vectorize::VectorMatchWithVector;
-
-/// Cosine similarity between two equal-length vectors. Assumes neither
-/// is the zero vector (Workers AI / Vectorize never emit a zero embedding
-/// for non-empty input). Returns 0.0 in the degenerate denominator case
-/// rather than NaN — defensive but unreachable in practice.
-fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
-    let mut dot = 0.0;
-    let mut na = 0.0;
-    let mut nb = 0.0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    let denom = na.sqrt() * nb.sqrt();
-    if denom <= f64::EPSILON {
-        return 0.0;
-    }
-    dot / denom
-}
 
 /// Rerank a candidate set (already roughly relevance-ordered from
 /// Vectorize) to balance relevance against diversity. Returns ids of
