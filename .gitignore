@@ -19,3 +19,13 @@ wrangler.toml
 # setup.sh's safety backup before patching IDs — same sensitivity as
 # wrangler.toml; do not commit.
 wrangler.toml.bak
+
+# Memory-data dumps, snapshots, and restore scripts — these contain REAL
+# memories (episodic/semantic/orientation content). Never commit, never publish.
+oneiro-memories-backup-*.json
+orientation-snapshot-*.json
+restore.sql
+
+# Per-machine opt-in marker: its presence enables PostCompact capture on THIS
+# machine (default-deny). Machine-local, never the repo's to decide.
+.oneiro-capture

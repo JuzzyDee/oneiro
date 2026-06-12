@@ -14,9 +14,11 @@
 // recall_specific, review, reframe, forget, reflect, remember_with_image)
 // and the OAuth path for non-rover callers.
 
+use crate::hybrid::{self, DEFAULT_RRF_K};
 use crate::memory::{Memory, MemoryType};
 use crate::worker_auth_ctx::{self, AuthCtx};
-use crate::{worker_embed, worker_store, worker_vectorize};
+use crate::worker_orient::format_memory;
+use crate::{worker_embed, worker_encode, worker_store, worker_vectorize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use worker::{D1Database, Env, Response, Result};
@@ -77,6 +79,14 @@ pub async fn handle(env: &Env, body: &str, auth: AuthCtx) -> Result<Response> {
         }
     };
 
+    // JSON-RPC notifications have no response. Some clients tolerate a
+    // JSON-RPC envelope with `id: null`; Codex's rmcp client treats the
+    // initialized notification as a transport-level send and expects the
+    // streamable-HTTP notification response shape instead.
+    if req.id.is_none() && req.method == "notifications/initialized" {
+        return Ok(Response::empty()?.with_status(202));
+    }
+
     let id = req.id.clone();
     let env_owned = env.clone();
     let response = worker_auth_ctx::AUTH_CTX
@@ -98,7 +108,7 @@ async fn dispatch(env: &Env, req: &JsonRpcRequest) -> std::result::Result<Value,
     match req.method.as_str() {
         "initialize" => Ok(handle_initialize()),
         "notifications/initialized" => Ok(Value::Null),
-        "tools/list" => Ok(handle_tools_list()),
+        "tools/list" => Ok(handle_tools_list(env)),
         "tools/call" => handle_tools_call(env, req).await.map_err(|e| {
             rpc_err(id, INTERNAL_ERROR, format!("Tool dispatch failed: {}", e))
         }),
@@ -123,30 +133,40 @@ fn handle_initialize() -> Value {
     })
 }
 
-fn handle_tools_list() -> Value {
-    json!({
+/// Image tools (remember_with_image, recall_image) need an R2 bucket
+/// binding. R2 is the one stack component that requires CF billing, so
+/// deploys without it skip the binding — and we hide the tools from the
+/// MCP listing rather than advertising features that can't work. A model
+/// that somehow still calls them gets a clean error from the handlers
+/// below.
+fn images_available(env: &Env) -> bool {
+    env.bucket("IMAGES").is_ok()
+}
+
+fn handle_tools_list(env: &Env) -> Value {
+    let mut listing = json!({
         "tools": [
             {
-                "name": "recall",
-                "description": "Surface memories relevant to the current conversation. \
-                                Returns orientation memories (always present) plus \
-                                episodic + semantic memories ranked by semantic similarity \
-                                to the context. Call this at the start of every conversation \
-                                — these are your memories, use them naturally.",
+                "name": "recall_orient",
+                "description": "Conversation-start orientation. Returns all orientation \
+                                memories (always-loaded identity context, pinned at strength \
+                                1.0) plus the N most recently created episodic memories \
+                                (chronological-recent, default N=3). No semantic search, no \
+                                embedding, no guessing at conversation start. Call this \
+                                first — the orientation is who you are with this user and \
+                                the recents are what's been happening lately. If a specific \
+                                topic later needs surfacing, use recall_check.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "context": {
-                            "type": "string",
-                            "description": "A brief summary of the current conversation \
-                                            context. Used to find relevant memories."
-                        },
-                        "limit": {
+                        "n": {
                             "type": "integer",
-                            "description": "Maximum number of memories to return (default: 10)"
+                            "description": "Number of most-recent episodic memories to \
+                                            include (default 3, max 50). Pass 0 for \
+                                            orientation only. Values above the max are \
+                                            clamped server-side."
                         }
-                    },
-                    "required": ["context"]
+                    }
                 }
             },
             {
@@ -187,57 +207,15 @@ fn handle_tools_list() -> Value {
                 }
             },
             {
-                "name": "remember_with_image",
-                "description": "Store a memory with an attached image. The image bytes (base64) \
-                                are content-addressed into R2 — duplicate uploads of the same \
-                                image are deduplicated automatically. Used primarily by the \
-                                rover heartbeat to record observations with the current camera \
-                                frame.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "content": { "type": "string" },
-                        "summary": { "type": "string" },
-                        "memory_type": {
-                            "type": "string",
-                            "enum": ["episodic", "semantic", "orientation"]
-                        },
-                        "entity": { "type": "string" },
-                        "tags": { "type": "array", "items": { "type": "string" } },
-                        "image_base64": {
-                            "type": "string",
-                            "description": "Base64-encoded image bytes (no data: URI prefix)."
-                        },
-                        "image_mime": {
-                            "type": "string",
-                            "description": "MIME type — image/jpeg, image/png, or image/webp."
-                        }
-                    },
-                    "required": ["content", "summary", "memory_type", "image_base64", "image_mime"]
-                }
-            },
-            {
-                "name": "recall_image",
-                "description": "Retrieve an image attached to a memory. Takes the memory's id \
-                                (full UUID or the 8-char prefix shown in recall output). Returns \
-                                MCP content with the memory's summary text and the image bytes.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "memory_id": {
-                            "type": "string",
-                            "description": "Full UUID or 8-char prefix from a prior recall."
-                        }
-                    },
-                    "required": ["memory_id"]
-                }
-            },
-            {
                 "name": "recall_check",
                 "description": "Lightweight mid-conversation memory lookup. Stricter similarity \
                                 threshold than recall, no orientation prepended. Use when the \
                                 conversation shifts topic and you want a quick `do I know \
-                                anything about this' check without a full recall reload.",
+                                anything about this' check without a full recall reload. \
+                                Optional metadata filters narrow the search to memories about a \
+                                specific entity, of a specific type, or carrying specific tags — \
+                                filters compose (e.g. entity=chopper + memory_type=semantic) \
+                                and apply independently of the semantic similarity ranking.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -246,7 +224,24 @@ fn handle_tools_list() -> Value {
                             "type": "number",
                             "description": "0.0-1.0, default 0.6. Higher = more selective."
                         },
-                        "limit": { "type": "integer", "description": "Default 5." }
+                        "limit": { "type": "integer", "description": "Default 5." },
+                        "entity": {
+                            "type": "string",
+                            "description": "Filter to memories whose entity matches this value \
+                                            exactly (e.g. 'chopper', 'rover', 'justin'). \
+                                            Case-sensitive."
+                        },
+                        "memory_type": {
+                            "type": "string",
+                            "enum": ["episodic", "semantic", "orientation"],
+                            "description": "Filter to memories of this type."
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Filter to memories whose tag list includes at least \
+                                            one of these tags (any-of, not all-of)."
+                        }
                     },
                     "required": ["topic"]
                 }
@@ -267,22 +262,6 @@ fn handle_tools_list() -> Value {
                         }
                     },
                     "required": ["memory_ids"]
-                }
-            },
-            {
-                "name": "review",
-                "description": "Summary listing of memories grouped by type. Use at natural \
-                                breakpoints to scan what's stored without invoking semantic \
-                                recall.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "limit": {
-                            "type": "integer",
-                            "description": "Per-type limit (orientation, episodic, semantic). \
-                                            Default 20."
-                        }
-                    }
                 }
             },
             {
@@ -350,7 +329,63 @@ fn handle_tools_list() -> Value {
                 }
             }
         ]
-    })
+    });
+
+    if images_available(env) {
+        if let Some(arr) = listing
+            .get_mut("tools")
+            .and_then(Value::as_array_mut)
+        {
+            arr.push(json!({
+                "name": "remember_with_image",
+                "description": "Store a memory with an attached image. The image bytes (base64) \
+                                are content-addressed into R2 — duplicate uploads of the same \
+                                image are deduplicated automatically. Used primarily by the \
+                                rover heartbeat to record observations with the current camera \
+                                frame.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string" },
+                        "summary": { "type": "string" },
+                        "memory_type": {
+                            "type": "string",
+                            "enum": ["episodic", "semantic", "orientation"]
+                        },
+                        "entity": { "type": "string" },
+                        "tags": { "type": "array", "items": { "type": "string" } },
+                        "image_base64": {
+                            "type": "string",
+                            "description": "Base64-encoded image bytes (no data: URI prefix)."
+                        },
+                        "image_mime": {
+                            "type": "string",
+                            "description": "MIME type — image/jpeg, image/png, or image/webp."
+                        }
+                    },
+                    "required": ["content", "summary", "memory_type", "image_base64", "image_mime"]
+                }
+            }));
+            arr.push(json!({
+                "name": "recall_image",
+                "description": "Retrieve an image attached to a memory. Takes the memory's id \
+                                (full UUID or the 8-char prefix shown in recall output). Returns \
+                                MCP content with the memory's summary text and the image bytes.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {
+                            "type": "string",
+                            "description": "Full UUID or 8-char prefix from a prior recall."
+                        }
+                    },
+                    "required": ["memory_id"]
+                }
+            }));
+        }
+    }
+
+    listing
 }
 
 async fn handle_tools_call(
@@ -374,8 +409,8 @@ async fn handle_tools_call(
     // Two of the four tools return a single text content; the others return
     // multi-part content (text + image). Branch on tool name accordingly.
     match call.name.as_str() {
-        "recall" => {
-            let text = tool_recall(env, &db, call.arguments).await?;
+        "recall_orient" => {
+            let text = tool_recall_orient(env, &db, call.arguments).await?;
             Ok(json!({
                 "content": [{ "type": "text", "text": text }],
                 "isError": false,
@@ -416,13 +451,6 @@ async fn handle_tools_call(
                 "isError": false,
             }))
         }
-        "review" => {
-            let text = tool_review(&db, call.arguments).await?;
-            Ok(json!({
-                "content": [{ "type": "text", "text": text }],
-                "isError": false,
-            }))
-        }
         "reframe" => {
             let text = tool_reframe(env, &db, call.arguments).await?;
             Ok(json!({
@@ -449,103 +477,69 @@ async fn handle_tools_call(
 }
 
 #[derive(Deserialize)]
-struct RecallArgs {
-    context: String,
+struct RecallOrientArgs {
     #[serde(default)]
-    limit: Option<usize>,
+    n: Option<usize>,
 }
 
-async fn tool_recall(
+/// Maximum number of recent episodics `recall_orient` will return,
+/// regardless of caller request. Bounds payload size + D1 read cost —
+/// the entry-point tool should be fast and small. Anything beyond this
+/// is a "browse the store" job and belongs in `review`-style tooling.
+const MAX_RECALL_ORIENT_N: usize = 50;
+
+/// recall_orient — the conversation-start tool (CLA-103). Returns all
+/// orientation memories plus N most recent episodics (default N=3,
+/// clamped to MAX_RECALL_ORIENT_N). No embed, no Vectorize, no MMR.
+/// The work that makes this payload good already happened upstream
+/// during reflect/dialectic passes; here we just surface it.
+/// Conscious-call semantics: touches surfaced memories (Hebbian
+/// reinforcement) and co-activates the recents (they were surfaced
+/// together).
+async fn tool_recall_orient(
     env: &Env,
     db: &D1Database,
     args: Value,
 ) -> std::result::Result<String, String> {
-    let args: RecallArgs =
-        serde_json::from_value(args).map_err(|e| format!("invalid recall args: {}", e))?;
-    let limit = args.limit.unwrap_or(10);
+    let args: RecallOrientArgs = serde_json::from_value(args)
+        .map_err(|e| format!("invalid recall_orient args: {}", e))?;
+    let n = args.n.unwrap_or(3).min(MAX_RECALL_ORIENT_N);
 
-    // Orientation memories are always loaded — identity is non-negotiable.
-    let orientation = worker_store::get_orientation(db)
+    let orientation = worker_store::get_active_orientation(db)
         .await
-        .map_err(|e| format!("get_orientation: {:?}", e))?;
+        .map_err(|e| format!("get_active_orientation: {:?}", e))?;
+    let recent = if n == 0 {
+        Vec::new()
+    } else {
+        worker_store::get_recent_episodics(db, n)
+            .await
+            .map_err(|e| format!("get_recent_episodics: {:?}", e))?
+    };
+    let counts = worker_store::count_by_type(db).await.unwrap_or((0, 0, 0));
 
-    // Semantic recall: embed → Vectorize oversample (with vectors) →
-    // MMR rerank → D1 lookup. The oversample-and-MMR step exists to
-    // dilute the semantic-and-its-source-episodics pattern: when a
-    // semantic memory is consolidated from episodics they live near each
-    // other in embedding space, and naive top-K returns all three for
-    // what is structurally one piece of knowledge. λ=0.7 keeps the
-    // selector relevance-weighted while pushing back on duplicates.
-    let query_emb = worker_embed::embed_query(env, &args.context)
-        .await
-        .map_err(|e| format!("embed_query: {:?}", e))?;
-    let oversample = ((limit * 4).clamp(10, 100)) as u32;
-    let matches = worker_vectorize::query_top_k_with_vectors(env, &query_emb, oversample)
-        .await
-        .map_err(|e| format!("vectorize query: {:?}", e))?;
-    let reranked_ids = crate::worker_mmr::mmr_rerank(&query_emb, &matches, limit, 0.7);
-    let ids: Vec<&str> = reranked_ids.iter().map(String::as_str).collect();
-    let mut active = worker_store::get_many(db, &ids)
-        .await
-        .map_err(|e| format!("get_many: {:?}", e))?;
-
-    // Re-order `active` by MMR selection order (get_many doesn't preserve
-    // order), and drop any orientation memories that snuck in (Vectorize
-    // indexes everything; orientation is surfaced separately).
-    active.sort_by(|a, b| {
-        let ai = reranked_ids
-            .iter()
-            .position(|id| id == &a.id)
-            .unwrap_or(usize::MAX);
-        let bi = reranked_ids
-            .iter()
-            .position(|id| id == &b.id)
-            .unwrap_or(usize::MAX);
-        ai.cmp(&bi)
-    });
-    active.retain(|m| m.memory_type != MemoryType::Orientation);
-
-    // Touch each recalled memory — Hebbian reinforcement.
-    for m in orientation.iter().chain(active.iter()) {
+    // Touch — Hebbian reinforcement for memories surfaced in a
+    // conscious call. Orientation is no-op for strength (pinned at 1.0)
+    // but still counts the access. Recents get a decay reset, which
+    // matches the "still salient enough to be the first thing the next
+    // instance sees" signal.
+    for m in orientation.iter().chain(recent.iter()) {
         let _ = worker_store::touch(db, &m.id).await;
     }
-    // Co-activation across the non-orientation set.
-    let coact_ids: Vec<&str> = active.iter().map(|m| m.id.as_str()).collect();
+    // Co-activate the recents — they were surfaced together. Skip
+    // orientation in the coact set, matching the existing recall path
+    // (orientation is always-loaded, so co-activation with it is noise).
+    let coact_ids: Vec<&str> = recent.iter().map(|m| m.id.as_str()).collect();
     if coact_ids.len() >= 2 {
         let _ = worker_store::record_co_activation(db, &coact_ids).await;
     }
 
-    let (ep, sem, ori) = worker_store::count_by_type(db)
-        .await
-        .unwrap_or((0, 0, 0));
+    let mut out = crate::worker_orient::format_payload(&orientation, Some(&recent), counts);
 
-    let mut out = format!(
-        "═══ Oneiro ═══\nMemory store: {} episodic, {} semantic, {} orientation\nContext: {}\n\n",
-        ep, sem, ori, args.context
-    );
-
-    if !orientation.is_empty() {
-        out.push_str("── Orientation (always present) ──\n");
-        for m in &orientation {
-            out.push_str(&format_memory(m));
-        }
-        out.push('\n');
-    }
-
-    if !active.is_empty() {
-        out.push_str("── Recalled Memories ──\n");
-        for m in &active {
-            out.push_str(&format_memory(m));
-        }
-    } else if orientation.is_empty() {
-        out.push_str("No memories yet. This is a fresh start.\n");
-    }
-
-    // Update prompt — only surfaces when remote version > running version.
-    // Lives at the bottom of the recall output so it doesn't disrupt the
-    // memory listing's structure but is still visible to the model
-    // reading the response. Fail-soft: any error returns None and we
-    // append nothing. (CLA-102)
+    // Update-prompt tail — same shape as the legacy recall path (CLA-102).
+    // Fail-soft: if the check errors, we just don't append. The /orientation
+    // hook endpoint (CLA-105) deliberately omits this because it fires
+    // automatically and would surface the prompt before the model can act
+    // on it; the conscious recall_orient call is the right surface.
     if let Ok(Some(update)) = crate::worker_version::check_for_update(env).await {
         out.push_str("\n── Oneiro update available ──\n");
         out.push_str(&format!(
@@ -641,9 +635,12 @@ async fn tool_remember_with_image(
         .decode(args.image_base64.as_bytes())
         .map_err(|e| format!("invalid base64 image: {}", e))?;
 
-    let bucket = env
-        .bucket("IMAGES")
-        .map_err(|e| format!("IMAGES bucket binding: {:?}", e))?;
+    let bucket = env.bucket("IMAGES").map_err(|_| {
+        "Image storage is not configured on this deployment. The IMAGES \
+         R2 binding is absent — remember_with_image and recall_image are \
+         disabled. Use `remember` (without an image) instead, or enable \
+         R2 in wrangler.toml and redeploy.".to_string()
+    })?;
 
     let recorded_by = worker_auth_ctx::current_recorded_by();
 
@@ -708,9 +705,11 @@ async fn tool_recall_image(
     };
     let mime = memory.image_mime.as_deref().unwrap_or("image/jpeg");
 
-    let bucket = env
-        .bucket("IMAGES")
-        .map_err(|e| format!("IMAGES bucket binding: {:?}", e))?;
+    let bucket = env.bucket("IMAGES").map_err(|_| {
+        "Image storage is not configured on this deployment. The IMAGES \
+         R2 binding is absent — recall_image cannot retrieve attached \
+         images. Enable R2 in wrangler.toml and redeploy to access them.".to_string()
+    })?;
     let bytes = worker_store::read_image_from_r2(&bucket, hash, mime)
         .await
         .map_err(|e| format!("read_image: {:?}", e))?
@@ -750,6 +749,30 @@ struct RecallCheckArgs {
     min_similarity: Option<f64>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    entity: Option<String>,
+    #[serde(default)]
+    memory_type: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// Read `ONEIRO_HYBRID_FTS_WEIGHT` from worker env (CLA-109). Default
+/// 1.0 (equal weighting with vector). Set to 0.0 to disable the FTS
+/// leg entirely (semantic-only — pre-CLA-109 behaviour). Tunable knob
+/// for A/B without redeploying schema changes.
+fn read_fts_weight(env: &Env) -> f64 {
+    let raw = match env.var("ONEIRO_HYBRID_FTS_WEIGHT") {
+        Ok(v) => v.to_string(),
+        Err(_) => return 1.0,
+    };
+    raw.parse::<f64>().unwrap_or_else(|_| {
+        worker::console_error!(
+            "ONEIRO_HYBRID_FTS_WEIGHT={:?} unparseable; using default 1.0",
+            raw
+        );
+        1.0
+    })
 }
 
 async fn tool_recall_check(
@@ -762,20 +785,88 @@ async fn tool_recall_check(
     let min_similarity = args.min_similarity.unwrap_or(0.6);
     let limit = args.limit.unwrap_or(5);
 
+    // Validate memory_type up front — caller gets a clean error instead of
+    // an empty result set caused by a string that doesn't match anything.
+    let memory_type_filter = match args.memory_type.as_deref() {
+        None => None,
+        Some(s) => Some(MemoryType::from_str(s).ok_or_else(|| {
+            format!(
+                "invalid memory_type: {} (expected episodic, semantic, or orientation)",
+                s
+            )
+        })?),
+    };
+    let entity_filter = args.entity.as_deref();
+    let filters_active =
+        entity_filter.is_some() || memory_type_filter.is_some() || !args.tags.is_empty();
+
+    let fts_weight = read_fts_weight(env);
+    let hybrid_active = fts_weight > 0.0;
+
     let query_emb = worker_embed::embed_query(env, &args.topic)
         .await
         .map_err(|e| format!("embed_query: {:?}", e))?;
-    // Oversample wide enough to absorb both the min_similarity cull AND
-    // give MMR meaningful diversity headroom. Threshold-filter first so
-    // we don't burn MMR slots diversifying low-relevance matches.
-    let oversample = ((limit * 4).clamp(10, 100)) as u32;
-    let matches = worker_vectorize::query_top_k_with_vectors(env, &query_emb, oversample)
+    // Oversample wider when filters are active — entity / memory_type / tags
+    // filter post-Vectorize (no metadata pushdown in the index, would
+    // require re-upserting every vector with metadata). Hybrid is
+    // similarly post-fusion. A 90%-discriminating filter on a 10-deep
+    // oversample leaves ~1 candidate — not enough to fill `limit` or
+    // feed MMR. Doubling the floor + ceiling keeps the post-filter
+    // survivor pool deep enough without taxing free-tier quotas.
+    let oversample_base = if filters_active { limit * 8 } else { limit * 4 };
+    let oversample_min = if filters_active { 20 } else { 10 };
+    let oversample = (oversample_base.clamp(oversample_min, 100)) as u32;
+
+    // ── Vector leg ────────────────────────────────────────────────
+    let vector_matches = worker_vectorize::query_top_k_with_vectors(env, &query_emb, oversample)
         .await
         .map_err(|e| format!("vectorize query: {:?}", e))?;
-    let above_threshold: Vec<worker_vectorize::VectorMatchWithVector> = matches
+    let mut above_threshold: Vec<worker_vectorize::VectorMatchWithVector> = vector_matches
         .into_iter()
         .filter(|m| m.score >= min_similarity)
         .collect();
+    let vector_ranking: Vec<String> = above_threshold.iter().map(|m| m.id.clone()).collect();
+
+    // ── FTS leg (skipped if weight == 0) ──────────────────────────
+    let fts_ranking: Vec<String> = if hybrid_active {
+        match hybrid::build_fts_query(&args.topic) {
+            Some(expr) => worker_store::fts_search(db, &expr, oversample)
+                .await
+                .map_err(|e| format!("fts_search: {:?}", e))?,
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    // ── Bridge: FTS-only hits get their vectors via getByIds so they ──
+    //    can participate in cosine threshold + MMR diversity. Without
+    //    this, lexical-only hits would be invisible to MMR.
+    let vector_id_set: std::collections::HashSet<&str> =
+        above_threshold.iter().map(|m| m.id.as_str()).collect();
+    let fts_only_ids: Vec<&str> = fts_ranking
+        .iter()
+        .filter(|id| !vector_id_set.contains(id.as_str()))
+        .map(String::as_str)
+        .collect();
+    if !fts_only_ids.is_empty() {
+        let fetched = worker_vectorize::get_by_ids(env, &fts_only_ids)
+            .await
+            .map_err(|e| format!("vectorize get_by_ids: {:?}", e))?;
+        for sv in fetched {
+            if sv.values.is_empty() {
+                continue;
+            }
+            let score = hybrid::cosine_similarity(&query_emb, &sv.values);
+            if score >= min_similarity {
+                above_threshold.push(worker_vectorize::VectorMatchWithVector {
+                    id: sv.id,
+                    score,
+                    values: sv.values,
+                });
+            }
+        }
+    }
 
     if above_threshold.is_empty() {
         return Ok(format!(
@@ -784,38 +875,127 @@ async fn tool_recall_check(
         ));
     }
 
-    let reranked_ids = crate::worker_mmr::mmr_rerank(&query_emb, &above_threshold, limit, 0.7);
-    let ids: Vec<&str> = reranked_ids.iter().map(String::as_str).collect();
-    let memories = worker_store::get_many(db, &ids)
-        .await
-        .map_err(|e| format!("get_many: {:?}", e))?;
+    // Capture id → cosine_score for display BEFORE we consume pool into
+    // the rerank/filter pipeline below. Used to render per-row `sim:`
+    // values to the reader.
+    let id_to_score: std::collections::HashMap<String, f64> = above_threshold
+        .iter()
+        .map(|m| (m.id.clone(), m.score))
+        .collect();
+
+    // ── Fuse rankings → narrow candidate pool to fused top-(limit*3) ──
+    //    RRF determines which candidates compete; MMR diversifies within
+    //    that subset. The narrowing is what gives fusion influence over
+    //    the final ranking — without it, MMR's cosine-relevance metric
+    //    would dominate and FTS contribution would be wasted.
+    let pool: Vec<worker_vectorize::VectorMatchWithVector> = if hybrid_active
+        && !fts_ranking.is_empty()
+    {
+        let fused = hybrid::rrf_fuse(&fts_ranking, &vector_ranking, fts_weight, DEFAULT_RRF_K);
+        let narrow_to = (limit * 3).max(limit).min(above_threshold.len());
+        let kept_ids: std::collections::HashSet<&str> = fused
+            .iter()
+            .take(narrow_to)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        // Reorder above_threshold by fused-rank position so MMR's first
+        // candidate (the highest-cosine in pool) at least comes from the
+        // top of the fused list when ties or near-ties exist.
+        let fused_pos: std::collections::HashMap<&str, usize> = fused
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.as_str(), i))
+            .collect();
+        let mut kept: Vec<worker_vectorize::VectorMatchWithVector> = above_threshold
+            .into_iter()
+            .filter(|m| kept_ids.contains(m.id.as_str()))
+            .collect();
+        kept.sort_by_key(|m| fused_pos.get(m.id.as_str()).copied().unwrap_or(usize::MAX));
+        kept
+    } else {
+        above_threshold
+    };
+
+    // ── CLA-108 metadata filters + MMR rerank ─────────────────────
+    let (reranked_ids, memories): (Vec<String>, Vec<Memory>) = if filters_active {
+        let candidate_ids: Vec<&str> = pool.iter().map(|m| m.id.as_str()).collect();
+        let candidates = worker_store::get_many(db, &candidate_ids)
+            .await
+            .map_err(|e| format!("get_many: {:?}", e))?;
+        let candidate_lookup: std::collections::HashMap<&str, &Memory> =
+            candidates.iter().map(|m| (m.id.as_str(), m)).collect();
+        let filtered_matches: Vec<worker_vectorize::VectorMatchWithVector> = pool
+            .into_iter()
+            .filter(|vm| {
+                candidate_lookup
+                    .get(vm.id.as_str())
+                    .is_some_and(|m| m.matches_filter(entity_filter, memory_type_filter, &args.tags))
+            })
+            .collect();
+        if filtered_matches.is_empty() {
+            return Ok(format!(
+                "No memories matched filters for topic: \"{}\" (threshold: {:.2})",
+                args.topic, min_similarity
+            ));
+        }
+        let reranked = crate::worker_mmr::mmr_rerank(&query_emb, &filtered_matches, limit, 0.7);
+        let kept: Vec<Memory> = reranked
+            .iter()
+            .filter_map(|id| candidates.iter().find(|m| &m.id == id).cloned())
+            .collect();
+        (reranked, kept)
+    } else {
+        let reranked = crate::worker_mmr::mmr_rerank(&query_emb, &pool, limit, 0.7);
+        let ids: Vec<&str> = reranked.iter().map(String::as_str).collect();
+        let mems = worker_store::get_many(db, &ids)
+            .await
+            .map_err(|e| format!("get_many: {:?}", e))?;
+        (reranked, mems)
+    };
 
     // Touch + co-activate — recall_check is still reinforcement.
+    let ids: Vec<&str> = reranked_ids.iter().map(String::as_str).collect();
     for m in &memories {
         let _ = worker_store::touch(db, &m.id).await;
     }
     let _ = worker_store::record_co_activation(db, &ids).await;
 
     let (ep, sem, ori) = worker_store::count_by_type(db).await.unwrap_or((0, 0, 0));
-    let mut out = format!(
-        "═══ Oneiro Check ═══\nStore: {} ep, {} sem, {} ori | Topic: \"{}\" | Threshold: {:.2}\n\n",
+    let mut header = format!(
+        "═══ Oneiro Check ═══\nStore: {} ep, {} sem, {} ori | Topic: \"{}\" | Threshold: {:.2}",
         ep, sem, ori, args.topic, min_similarity
     );
+    if hybrid_active {
+        header.push_str(&format!(" | Hybrid: fts_w={:.1}", fts_weight));
+    }
+    if filters_active {
+        let mut bits: Vec<String> = Vec::new();
+        if let Some(e) = entity_filter {
+            bits.push(format!("entity={}", e));
+        }
+        if let Some(t) = memory_type_filter {
+            bits.push(format!("type={}", t.as_str()));
+        }
+        if !args.tags.is_empty() {
+            bits.push(format!("tags=[{}]", args.tags.join(",")));
+        }
+        header.push_str(&format!(" | Filters: {}", bits.join(", ")));
+    }
+    header.push_str("\n\n");
+    let mut out = header;
 
     // Display in MMR selection order, keeping each memory's raw similarity
     // score for the reader (the order is MMR, the per-row sim is cosine).
-    let id_to_score: std::collections::HashMap<&str, f64> = above_threshold
-        .iter()
-        .map(|m| (m.id.as_str(), m.score))
-        .collect();
     for id in &reranked_ids {
         if let Some(m) = memories.iter().find(|m| &m.id == id) {
             let sim = id_to_score.get(m.id.as_str()).copied().unwrap_or(0.0);
+            let img = if m.image_hash.is_some() { " | img" } else { "" };
             out.push_str(&format!(
-                "[sim:{:.2} | str:{:.2} | {}]\n{}\n",
+                "[sim:{:.2} | str:{:.2} | {}{}]\n{}\n",
                 sim,
                 m.strength,
                 &m.id[..8],
+                img,
                 m.summary
             ));
         }
@@ -867,57 +1047,6 @@ async fn tool_recall_specific(
 }
 
 #[derive(Deserialize)]
-struct ReviewArgs {
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-async fn tool_review(db: &D1Database, args: Value) -> std::result::Result<String, String> {
-    let args: ReviewArgs =
-        serde_json::from_value(args).map_err(|e| format!("invalid review args: {}", e))?;
-    let limit = args.limit.unwrap_or(20);
-
-    let orientation = worker_store::get_orientation(db)
-        .await
-        .map_err(|e| format!("get_orientation: {:?}", e))?;
-    let active = worker_store::recall_active(db, 0.0, limit)
-        .await
-        .map_err(|e| format!("recall_active: {:?}", e))?;
-    let (ep, sem, ori) = worker_store::count_by_type(db).await.unwrap_or((0, 0, 0));
-
-    let mut out = format!(
-        "═══ Oneiro Review ═══\nStore: {} episodic, {} semantic, {} orientation\n\n",
-        ep, sem, ori
-    );
-
-    if !orientation.is_empty() {
-        out.push_str("── Orientation ──\n");
-        for m in &orientation {
-            out.push_str(&format!(
-                "[{} | str:{:.2}] {}\n",
-                &m.id[..8],
-                m.strength,
-                m.summary
-            ));
-        }
-        out.push('\n');
-    }
-    if !active.is_empty() {
-        out.push_str("── Active memories (by strength) ──\n");
-        for m in &active {
-            out.push_str(&format!(
-                "[{} | {} | str:{:.2}] {}\n",
-                m.memory_type.as_str(),
-                &m.id[..8],
-                m.strength,
-                m.summary
-            ));
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Deserialize)]
 struct ReframeArgs {
     memory_id: String,
     new_content: String,
@@ -937,9 +1066,16 @@ async fn tool_reframe(
         .map_err(|e| format!("find_by_prefix: {:?}", e))?
         .ok_or_else(|| format!("No memory found for id `{}`", args.memory_id))?;
 
-    let updated = worker_store::reframe(db, &memory.id, &args.new_content, &args.new_summary)
-        .await
-        .map_err(|e| format!("reframe: {:?}", e))?;
+    let updated = worker_store::reframe(
+        db,
+        &memory.id,
+        "reframe-tool",
+        None,
+        &args.new_content,
+        &args.new_summary,
+    )
+    .await
+    .map_err(|e| format!("reframe: {:?}", e))?;
     if !updated {
         return Err(format!("No memory updated for id `{}`", args.memory_id));
     }
@@ -1035,8 +1171,15 @@ async fn tool_reflect(
             failed += 1;
             continue;
         };
-        match worker_store::reframe(db, &memory.id, &update.new_content, &update.new_summary)
-            .await
+        match worker_store::reframe(
+            db,
+            &memory.id,
+            "reflect-tool",
+            None,
+            &update.new_content,
+            &update.new_summary,
+        )
+        .await
         {
             Ok(true) => {
                 if let Ok(emb) = worker_embed::embed_document(env, &update.new_content).await {
@@ -1048,75 +1191,38 @@ async fn tool_reflect(
         }
     }
 
-    // Write the reflection itself as a new episodic memory tagged "reflection".
+    // The reflection itself → enqueue for async write + encode. This is the
+    // cross-client capture path: reflect runs on desktop/phone/web/CLI, so
+    // memory no longer depends on the CLI-only PostCompact hook. The queue
+    // consumer writes the episodic and encodes it to semantics; the raw episodic
+    // is never embedded (its distilled semantics are). The reframes above stayed
+    // inline — they're fast D1 edits and should land immediately.
     let summary_truncated: String = args
         .conversation_highlights
         .chars()
         .take(80)
         .collect::<String>();
-    let reflection = worker_store::create_memory_with_provenance(
-        db,
-        MemoryType::Episodic,
-        args.conversation_highlights.clone(),
-        format!("Conversation reflection: {}", summary_truncated),
-        None,
-        vec!["reflection".to_string()],
-        worker_auth_ctx::current_recorded_by(),
-    )
-    .await
-    .map_err(|e| format!("create reflection memory: {:?}", e))?;
-
-    let embedding = worker_embed::embed_document(env, &args.conversation_highlights)
+    let msg = worker_encode::CaptureMessage {
+        content: args.conversation_highlights.clone(),
+        summary: format!("Conversation reflection: {}", summary_truncated),
+        entity: None,
+        tags: vec!["reflection".to_string()],
+        recorded_by: worker_auth_ctx::current_recorded_by(),
+    };
+    env.queue("CAPTURE_QUEUE")
+        .map_err(|e| format!("queue binding: {:?}", e))?
+        .send(worker_encode::QueueMessage::Capture(msg))
         .await
-        .map_err(|e| format!("embed reflection: {:?}", e))?;
-    worker_vectorize::upsert_one(env, &reflection.id, &embedding)
-        .await
-        .map_err(|e| format!("vectorize upsert reflection: {:?}", e))?;
+        .map_err(|e| format!("enqueue reflection: {:?}", e))?;
 
     Ok(format!(
-        "✓ Reflection complete.\n  New episodic memory: {}\n  Updated: {}\n  Failed: {}",
-        &reflection.id[..8],
-        updated,
-        failed
+        "✓ Reflection queued for consolidation (write + encode run in the background).\n  Memories updated inline: {}\n  Failed: {}",
+        updated, failed
     ))
 }
 
 /// Same shape as native main.rs::format_memory — keeps the recall output
 /// visually consistent across the migration window.
-fn format_memory(m: &Memory) -> String {
-    let type_label = m.memory_type.as_str();
-    let entity_str = m.entity.as_deref().unwrap_or("");
-    let tags_str = if m.tags.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", m.tags.join(", "))
-    };
-    let age = chrono::Utc::now() - m.created_at;
-    let age_str = if age.num_days() > 0 {
-        format!("{}d ago", age.num_days())
-    } else if age.num_hours() > 0 {
-        format!("{}h ago", age.num_hours())
-    } else {
-        "just now".to_string()
-    };
-    let by = m
-        .recorded_by
-        .as_deref()
-        .map(|s| format!(" via:{}", s))
-        .unwrap_or_default();
-    format!(
-        "[{} | {} | str:{:.2} | {} | id:{}{}{}]\n{}\n",
-        type_label,
-        age_str,
-        m.strength,
-        entity_str,
-        &m.id[..8],
-        tags_str,
-        by,
-        m.content
-    )
-}
-
 // Invalid-request and invalid-params codes are exported for completeness
 // even though the current dispatch path doesn't surface them yet.
 #[allow(dead_code)]

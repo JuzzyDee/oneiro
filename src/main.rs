@@ -23,6 +23,7 @@ mod auth_ctx;
 #[allow(dead_code)]
 mod dialectic_validation;
 mod embed;
+mod hybrid;
 mod key_rate;
 mod memory;
 mod store;
@@ -1181,6 +1182,7 @@ fn run_migrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut role: Option<api_key::Role> = None;
+    let mut quiet = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1190,16 +1192,23 @@ fn run_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--role requires a value (e.g. --role rover)")?;
                 role = Some(api_key::Role::from_str(value).ok_or_else(|| {
                     format!(
-                        "unknown role: {}. Known roles: rover",
+                        "unknown role: {}. Known roles: rover, hook",
                         value
                     )
                 })?);
                 i += 2;
             }
+            "--quiet" => {
+                quiet = true;
+                i += 1;
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: oneiro keygen --role <role>");
+                eprintln!("Usage: oneiro keygen --role <role> [--quiet]");
                 eprintln!();
-                eprintln!("Roles: rover");
+                eprintln!("Roles: rover, hook");
+                eprintln!();
+                eprintln!("--quiet  Emit only the raw key and env entry to stdout,");
+                eprintln!("         one per line. For scripting (e.g. setup.sh).");
                 return Ok(());
             }
             other => {
@@ -1214,7 +1223,11 @@ fn run_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     let role = role.ok_or("--role is required (e.g. --role rover)")?;
     let key = api_key::generate_api_key(role)?;
-    api_key::print_generated_key(&key);
+    if quiet {
+        api_key::print_generated_key_quiet(&key);
+    } else {
+        api_key::print_generated_key(&key);
+    }
     Ok(())
 }
 

@@ -31,18 +31,25 @@ pub enum Role {
     /// The rover's heartbeat loop. Reads + remember/remember_with_image,
     /// with entity forced to "rover" on writes (enforced in phase 4).
     Rover,
+    /// Claude Code harness hooks (CLA-116). Orients to open a session
+    /// (recall_orient) and encodes a capture to close it (/encode) — and
+    /// nothing else. A leaked hook key cannot read the store
+    /// (recall_specific/recall_check) or write arbitrary memories.
+    Hook,
 }
 
 impl Role {
     pub fn as_str(&self) -> &'static str {
         match self {
             Role::Rover => "rover",
+            Role::Hook => "hook",
         }
     }
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "rover" => Some(Role::Rover),
+            "hook" => Some(Role::Hook),
             _ => None,
         }
     }
@@ -54,22 +61,31 @@ impl Role {
     /// reframe, forget, or reflect — the worst they can do is read existing
     /// memories and add new ones (which the audit trail captures).
     ///
-    /// The `rover` allowlist (CLA-86 §3):
-    ///   reads:  recall, recall_check, recall_specific, recall_image, review
+    /// The `rover` allowlist (CLA-86 §3, updated CLA-103):
+    ///   reads:  recall_orient, recall_check, recall_specific, recall_image
     ///   writes: remember, remember_with_image  (entity forced server-side
     ///                                           to "rover" in phase 4)
+    ///
+    /// `recall` and `review` retired in CLA-103. `recall` was replaced by
+    /// `recall_orient` (orientation + N recent, no semantic guess at t=0).
+    /// `review` was only ever for the dialectic, which calls into
+    /// worker_store directly without going through the MCP layer.
     pub fn allows(&self, tool: &str) -> bool {
         match self {
             Role::Rover => matches!(
                 tool,
-                "recall"
+                "recall_orient"
                     | "recall_check"
                     | "recall_specific"
                     | "recall_image"
-                    | "review"
                     | "remember"
                     | "remember_with_image"
             ),
+            // Hook (CLA-116): orient to open a session, encode to close it.
+            // Cannot read the store (recall_specific/recall_check) or write
+            // arbitrary memories — minimal surface for a key that lives on
+            // every machine an instance runs on.
+            Role::Hook => matches!(tool, "recall_orient" | "encode"),
         }
     }
 }
@@ -261,6 +277,15 @@ pub fn print_generated_key(key: &GeneratedKey) {
     eprintln!();
     eprintln!("  ⚠ The raw key will NOT be shown again. Store it now.");
     eprintln!();
+}
+
+/// Print a newly-generated key to stdout in machine-parseable form: two
+/// lines, raw key first then env entry. Used by setup.sh to capture both
+/// values deterministically. Caller still owns the "store this now"
+/// responsibility — quiet mode just changes the output shape.
+pub fn print_generated_key_quiet(key: &GeneratedKey) {
+    println!("{}", key.raw);
+    println!("{}", key.env_entry());
 }
 
 #[cfg(test)]

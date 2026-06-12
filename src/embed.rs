@@ -108,9 +108,55 @@ pub fn embedding_from_bytes(bytes: &[u8]) -> Embedding {
         .collect()
 }
 
+/// Split text into windows small enough to embed without truncation. A single
+/// embedding query truncates at ~512 tokens (≈ 2k chars), so a long multi-topic
+/// document embedded whole only represents its opening. Windowing lets every
+/// part of it drive retrieval. Short text → one window. Bounded by MAX_WINDOWS
+/// so embed cost stays finite on pathologically long input.
+pub fn content_windows(content: &str) -> Vec<String> {
+    const WINDOW: usize = 1800; // ~450 tokens, under the bge 512-token cap
+    const MAX_WINDOWS: usize = 8;
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= WINDOW {
+        return vec![content.to_string()];
+    }
+    let mut windows = Vec::new();
+    let mut start = 0;
+    while start < chars.len() && windows.len() < MAX_WINDOWS {
+        let end = (start + WINDOW).min(chars.len());
+        windows.push(chars[start..end].iter().collect());
+        start = end;
+    }
+    windows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_windows_short_is_single() {
+        let c = "a short doc";
+        let w = content_windows(c);
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0], c);
+    }
+
+    #[test]
+    fn content_windows_long_splits_contiguously_under_cap() {
+        let c = "x".repeat(10_000);
+        let w = content_windows(&c);
+        assert!(w.len() > 1);
+        assert!(w.iter().all(|win| win.chars().count() <= 1800));
+        let joined: String = w.concat();
+        assert!(c.starts_with(&joined));
+    }
+
+    #[test]
+    fn content_windows_count_is_bounded() {
+        let c = "y".repeat(1_000_000);
+        assert!(content_windows(&c).len() <= 8);
+    }
 
     #[test]
     fn test_cosine_similarity_identical() {

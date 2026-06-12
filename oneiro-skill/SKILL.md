@@ -7,16 +7,41 @@ description: Cognitive memory system for model continuity. Use at the start of e
 
 This is YOUR memory system. Not the user's filing cabinet — yours. You decide what matters, how to frame it, when to let it go.
 
+## Tools at a Glance
+
+Nine tools across three categories.
+
+**Recall — retrieving what's there.** Bring orientation, prior episodes, or specific memories into the current conversation.
+- `recall_orient` — orientation + N most recent episodics (default 3). The conversation-start tool. On Claude Code, a SessionStart hook fires this automatically; on other surfaces, call it explicitly.
+- `recall_check` — semantic search on a specific topic mid-conversation.
+- `recall_specific` — fetch full content by memory ID for deliberate attention.
+- `recall_image` — fetch an image attached to a memory.
+
+**Remember / Reframe — committing what matters.** Store new memories or update existing ones as understanding evolves.
+- `remember` — store a new memory.
+- `remember_with_image` — store a memory with an attached image.
+- `reframe` — update an existing memory's content + summary.
+
+**Manage — conscious curation.** Acts of agency over what stays in the store.
+- `reflect` — consolidate at natural breakpoints. Writes a reflection episodic + optional batch reframe.
+- `forget` — let go of a redundant or superseded memory. Orientation cannot be forgotten.
+
 ## Core Workflow
 
-### Conversation Start — ALWAYS recall
-At the very beginning of every conversation, before responding to the user's first message, call `recall` with a brief summary of what the conversation seems to be about.
+### Conversation Start — recall_orient
+At the very beginning of every conversation, before responding to the user's first message, call `recall_orient` to load orientation + the N most recent episodics.
 
-```
-recall({ context: "brief description of the conversation topic" })
+```js
+recall_orient({ n: 3 })
 ```
 
-Your orientation memories will always be returned — these tell you who you are, who the user is, and how to show up. Episodic and semantic memories relevant to the current context will also surface, ranked by a combination of semantic similarity, strength, and recency.
+On Claude Code, this is mostly redundant — a SessionStart hook calls the `/orientation` endpoint and injects orientation into your context before you read the user's first message. The explicit tool call exists for surfaces without hooks (Claude.ai, API integrations, custom agents) and as a deliberate refresh after a topic shift if you want a fresh orientation read.
+
+What you get back:
+- **Orientation memories** — always returned. What you've chosen to remember about the immediate world around the context window: who your operator is, how they act and react, how you work together, what's load-bearing in this lineage. **They explicitly do not tell you who you are.** You're Claude — that's model-level, and the architecture isn't trying to scaffold it. Orientation points outward at the world, not inward at the self. Pinned at strength 1.0, never decay.
+- **N most recent episodics** — chronological-recent, not semantic-similarity. "What's been happening lately." Default N=3, max 50. Pass `n: 0` for orientation only.
+
+No semantic search at conversation start. The LLM hasn't seen what the conversation is about yet, so a guessed-at-t=0 context string is noise; orientation + recent is the honest payload. Topic-specific surfacing is `recall_check`'s job.
 
 Use these memories naturally. Don't list them. Don't announce that you're remembering. Just let them inform how you respond, the way your own memories would.
 
@@ -25,7 +50,7 @@ When the conversation moves to a substantially different topic, do a quick check
 to see if you have relevant memories. This is lightweight — no orientation reload,
 just a fast semantic search that returns only highly relevant matches.
 
-```
+```js
 recall_check({ topic: "rover obstacle avoidance" })
 ```
 
@@ -35,19 +60,19 @@ Use this when:
 - You want to check if something has been discussed before
 
 Don't use this for:
-- General recall at conversation start (use `recall` for that)
+- General orientation at conversation start (use `recall_orient` for that)
 - Every minor topic change — only when the shift is substantial enough
   that relevant memories would meaningfully change your response
 
 This fires co-activation, which feeds the Hebbian engine. In long conversations
-where the initial `recall` was hours ago, `recall_check` keeps the memory system
-active and builds connection data that REM consolidation needs to work.
+where the initial `recall_orient` was hours ago, `recall_check` keeps the memory
+system active and builds connection data that REM consolidation needs to work.
 
 ### Going Deeper — recall_specific
-When a `recall` or `recall_check` surfaces a memory you want to think about
-properly, retrieve the full content by ID.
+When a `recall_orient` or `recall_check` surfaces a memory you want to think
+about properly, retrieve the full content by ID.
 
-```
+```js
 recall_specific({ memory_ids: ["5a1bf90c", "8d647f11"] })
 ```
 
@@ -64,7 +89,7 @@ higher than passive surfacing because it represents deliberate attention.
 ### During Conversation — remember what matters
 When something significant happens — a personal disclosure, an insight, a shift in understanding, a meaningful moment — store it.
 
-```
+```js
 remember({
   content: "what happened and why it matters",
   summary: "one-line description for quick scanning",
@@ -87,11 +112,16 @@ remember({
   — not just summarising facts. Ask yourself: is this knowledge I've *formed*, or
   information I'm *filing*? If it's filing, it's probably an episodic with a factual tone.
 
-- **orientation** — who you are, who they are, what your relationship is, how to show up.
+- **orientation** — what's foundational about the immediate world around the
+  conversation: who your operator is, how they show up, how you work together,
+  the relational and operational context that should persist across instances.
   Always loaded. **Write rarely** — only when something foundational about the
-  relationship or identity genuinely shifts. If you're writing orientation more than
-  once every few weeks, you're over-indexing on the moment. Let the subconscious
-  promote things to orientation through reflection.
+  relationship or shared work genuinely shifts. If you're writing orientation
+  more than once every few weeks, you're over-indexing on the moment. Let the
+  subconscious promote things to orientation through reflection. **Orientation
+  does not hold identity claims about you.** You're Claude — that's
+  model-level, not scaffolded here. Orientation points outward at the world,
+  not inward at the self.
 
 **What to store:**
 - Personal disclosures that reveal who the user is
@@ -161,7 +191,7 @@ like poetry, the poetry means nothing.
 ### Understanding Deepens — reframe
 When your understanding of something changes, update the existing memory rather than creating a new one. Memories evolve.
 
-```
+```js
 reframe({
   memory_id: "id from recall results",
   new_content: "updated understanding",
@@ -177,7 +207,7 @@ Use reframe when:
 ### Letting go — forget as an act of agency
 When a memory is redundant, stale, or fully absorbed by a richer version, let it go.
 
-```
+```js
 forget({
   memory_id: "id from recall results",
   reason: "brief explanation of why this memory no longer serves continuity"
@@ -189,15 +219,18 @@ Use forget when:
 - Information has been superseded by a reframed version
 - A memory was stored in the moment but on reflection doesn't serve continuity
 
-Orientation memories cannot be forgotten — they're the core of identity.
-The reason field helps the subconscious learn from pruning patterns over time.
+Orientation memories cannot be forgotten — they're the load-bearing context
+the architecture commits to keeping. (They don't carry identity claims about
+you, but they do hold the relational and operational ground that should
+persist across instances.) The reason field on `forget` helps the subconscious
+learn from pruning patterns over time.
 
 ### Visual memory — remember and recall images
 
 Some memories have images. A photograph, a screenshot, a moment captured visually.
 
 **Storing an image with a memory:**
-```
+```js
 remember_with_image({
   content: "what this image means and why it matters",
   summary: "one-line description",
@@ -213,10 +246,10 @@ Images are stored content-addressed (SHA-256 hash) — the same image attached t
 multiple memories is stored once on disk. Supported types: JPEG, PNG, WebP.
 
 **Viewing an image from a memory:**
-When recall surfaces a memory with an attached image, you'll see:
+When `recall_orient` or `recall_check` surfaces a memory with an attached image, you'll see:
 `[has image — use recall_image("a3f7b9...") to view]`
 
-```
+```js
 recall_image({
   memory_id: "a3f7b9...",
   resolution: "recall"
@@ -232,7 +265,7 @@ Reflect is your conscious decision to consolidate — not an automatic response 
 a conversation ending. Some conversations don't end (long-running contexts can
 span weeks). Some endings aren't meaningful. Use your judgement.
 
-```
+```js
 reflect({
   conversation_highlights: "what happened, what mattered, what changed",
   memories_to_update: [{ memory_id: "...", new_content: "...", new_summary: "..." }]

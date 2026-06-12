@@ -10,16 +10,16 @@
 //   1. Vectorize.query(embedding) → top-k memory_ids
 //   2. SELECT … FROM memories WHERE id IN (?, ?, …)
 //
-// Phase 2b.1 (this commit) implements the minimum viable set:
+// Phase 2b.1 implemented the minimum viable set:
 //
 //   create_memory_with_provenance — INSERT a memory row
 //   get                            — SELECT one by id
-//   recall_active                  — SELECT top-k by strength
 //
 // Embedding generation (Workers AI) and Vectorize integration land in
 // CLA-84 phases 3 + 4. Subsequent commits add `find_neighbours`,
-// `recall_semantic`, `touch`, `forget`, `consolidate`, `reframe`,
-// `record_co_activation`, `apply_decay`, and the image-handling paths.
+// `touch`, `forget`, `consolidate`, `reframe`, `record_co_activation`,
+// `apply_decay`, and the image-handling paths. CLA-103 retired
+// `recall_active` (was only used by the now-removed `review` tool).
 
 use crate::memory::{Memory, MemoryType};
 use chrono::{DateTime, Utc};
@@ -172,32 +172,6 @@ pub async fn get(db: &D1Database, id: &str) -> Result<Option<Memory>> {
     Ok(row.map(MemoryRow::into_memory))
 }
 
-/// Top-k active memories by strength. Filters out orientation memories
-/// (those load via a separate `get_orientation` path) so they don't
-/// crowd the active set.
-pub async fn recall_active(
-    db: &D1Database,
-    min_strength: f64,
-    limit: usize,
-) -> Result<Vec<Memory>> {
-    let rows: Vec<MemoryRow> = db
-        .prepare(
-            "SELECT id, memory_type, content, summary, created_at, last_accessed,
-                    access_count, strength, stability, entity, tags, image_hash,
-                    image_mime, recorded_by
-             FROM memories
-             WHERE strength >= ?
-               AND memory_type != 'orientation'
-             ORDER BY strength DESC
-             LIMIT ?",
-        )
-        .bind(&[min_strength.into(), (limit as u32).into()])?
-        .all()
-        .await?
-        .results()?;
-    Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
-}
-
 /// INSERT a memory record verbatim — preserves the caller's id,
 /// timestamps, strength, all fields exactly. Used by /admin/import
 /// during data migration (CLA-84 phase 8) so the migrated rows keep
@@ -287,7 +261,8 @@ pub async fn get_many(db: &D1Database, ids: &[&str]) -> Result<Vec<Memory>> {
                 access_count, strength, stability, entity, tags, image_hash,
                 image_mime, recorded_by
          FROM memories
-         WHERE id IN ({})",
+         WHERE id IN ({})
+           AND superseded = 0",
         placeholders
     );
     let bindings: Vec<worker::wasm_bindgen::JsValue> = ids.iter().map(|id| (*id).into()).collect();
@@ -300,7 +275,10 @@ pub async fn get_many(db: &D1Database, ids: &[&str]) -> Result<Vec<Memory>> {
     Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
 }
 
-/// All orientation memories. Always loaded — the core of identity.
+/// All current orientation memories. Always loaded — the core of identity.
+/// Excludes superseded rows: once the orientation distiller can supersede an
+/// axis (CLA-125, progression/correction), recall must surface only the current
+/// head, never the retired synthesis kept underneath as history.
 pub async fn get_orientation(db: &D1Database) -> Result<Vec<Memory>> {
     let rows: Vec<MemoryRow> = db
         .prepare(
@@ -308,7 +286,7 @@ pub async fn get_orientation(db: &D1Database) -> Result<Vec<Memory>> {
                     access_count, strength, stability, entity, tags, image_hash,
                     image_mime, recorded_by
              FROM memories
-             WHERE memory_type = 'orientation'
+             WHERE memory_type = 'orientation' AND superseded = 0
              ORDER BY created_at ASC",
         )
         .bind(&[])?
@@ -316,6 +294,184 @@ pub async fn get_orientation(db: &D1Database) -> Result<Vec<Memory>> {
         .await?
         .results()?;
     Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// The ACTIVE orientation set — what a fresh instance loads at session-start.
+/// `get_orientation` returns every live axis (the judge's view, so it can
+/// link/revise/reactivate a dormant one); recall and the hook want only the
+/// axes the Whittling left switched on (CLA-126). Migration 0013 defaults
+/// `is_active = 1`, so this equals `get_orientation` until the first Whittle.
+pub async fn get_active_orientation(db: &D1Database) -> Result<Vec<Memory>> {
+    let rows: Vec<MemoryRow> = db
+        .prepare(
+            "SELECT id, memory_type, content, summary, created_at, last_accessed,
+                    access_count, strength, stability, entity, tags, image_hash,
+                    image_mime, recorded_by
+             FROM memories
+             WHERE memory_type = 'orientation' AND superseded = 0 AND is_active = 1
+             ORDER BY created_at ASC",
+        )
+        .bind(&[])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// Stamp an orientation axis's M — the model-supplied "importance-for-relating"
+/// (1–10) read only by the Whittling (CLA-126). No-op when `meaning` is None
+/// (the judge omitted it on a revise → keep the existing M; the one-off backfill
+/// fills the NULLs on pre-existing axes). Cast to i32 for the JsValue bind —
+/// the column is a small INTEGER, never near i32 range.
+pub async fn set_meaning(db: &D1Database, id: &str, meaning: Option<i64>) -> Result<()> {
+    let Some(m) = meaning else {
+        return Ok(());
+    };
+    db.prepare("UPDATE memories SET meaning = ? WHERE id = ?")
+        .bind(&[(m as i32).into(), id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// Set the core pin on an orientation axis — the lens/reference re-scope
+/// (CLA-126). `true` pins it as a lens (never deactivated, higher size ceiling);
+/// `false` demotes it to reference. Reversible; the backup holds the prior flags.
+pub async fn set_core(db: &D1Database, id: &str, core: bool) -> Result<()> {
+    let v: i32 = if core { 1 } else { 0 };
+    db.prepare("UPDATE memories SET core = ? WHERE id = ?")
+        .bind(&[v.into(), id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+// ── Stage C: the Whittling (CLA-126) ─────────────────────────────────────────
+// The pure-query maintenance cut. These two primitives are the only DB the
+// Whittle touches: read every live axis with its R/F/M ingredients, then apply
+// the active/dormant split atomically. No model is involved — that is the point.
+
+/// One live orientation axis with the raw R/F/M ingredients the Whittle ranks on.
+/// `freq` (F) is the inbound semantic_orientation edge count — how many semantics
+/// fed this axis. `last_accessed` (R) is the last re-orientation touch. `meaning`
+/// (M) is the stored standing-importance, NULL until rated. `content` is carried
+/// for the one-off backfill (carve + rate); the Whittle ignores it.
+#[derive(serde::Deserialize)]
+pub struct OrientRankRow {
+    pub id: String,
+    pub summary: String,
+    pub content: String,
+    pub last_accessed: String,
+    pub meaning: Option<i64>,
+    pub core: i64,
+    pub freq: i64,
+}
+
+/// Every live orientation axis with its R/F/M ingredients (active or not — the
+/// Whittle ranks the whole set to decide who stays active).
+pub async fn orientation_ranking_rows(db: &D1Database) -> Result<Vec<OrientRankRow>> {
+    let rows: Vec<OrientRankRow> = db
+        .prepare(
+            "SELECT m.id, m.summary, m.content, m.last_accessed, m.meaning, m.core,
+                    (SELECT COUNT(*) FROM consolidation_lineage l
+                      WHERE l.parent_id = m.id AND l.edge_type = 'semantic_orientation')
+                       AS freq
+             FROM memories m
+             WHERE m.memory_type = 'orientation' AND m.superseded = 0",
+        )
+        .bind(&[])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows)
+}
+
+/// Apply the Whittle's verdict: switch `active_ids` ON and every other live axis
+/// OFF, in ONE atomic batch so recall never sees a moment with orientation
+/// blanked. A dormant axis keeps its row and edges — it is reactivated the
+/// instant a later Whittle re-ranks it up (deactivate, never delete). Empty
+/// `active_ids` means there is no orientation at all → no-op (never blank the set).
+pub async fn apply_orientation_activation(db: &D1Database, active_ids: &[String]) -> Result<()> {
+    if active_ids.is_empty() {
+        return Ok(());
+    }
+    let deactivate = db
+        .prepare(
+            "UPDATE memories SET is_active = 0
+             WHERE memory_type = 'orientation' AND superseded = 0",
+        )
+        .bind(&[])?;
+    let placeholders = vec!["?"; active_ids.len()].join(", ");
+    let activate_sql = format!("UPDATE memories SET is_active = 1 WHERE id IN ({})", placeholders);
+    let binds: Vec<worker::wasm_bindgen::JsValue> =
+        active_ids.iter().map(|s| s.as_str().into()).collect();
+    let activate = db.prepare(activate_sql.as_str()).bind(&binds)?;
+    db.batch(vec![deactivate, activate]).await?;
+    Ok(())
+}
+
+/// N most recently created episodic memories. Used by `recall_orient`
+/// (CLA-103) as the "what's been happening lately" half of the
+/// conversation-start payload. Ordered by `created_at DESC` rather than
+/// `last_accessed DESC` — the intent is chronological-recent ("what
+/// happened recently") rather than salience-recent ("what's hot right
+/// now"); the salience case is served by `recall_check`.
+pub async fn get_recent_episodics(db: &D1Database, limit: usize) -> Result<Vec<Memory>> {
+    let rows: Vec<MemoryRow> = db
+        .prepare(
+            "SELECT id, memory_type, content, summary, created_at, last_accessed,
+                    access_count, strength, stability, entity, tags, image_hash,
+                    image_mime, recorded_by
+             FROM memories
+             WHERE memory_type = 'episodic'
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(&[(limit as u32).into()])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// BM25-ranked full-text search via the memories_fts virtual table
+/// (CLA-109). Returns memory IDs in rank order (best match first). The
+/// caller passes a pre-built FTS5 MATCH expression — use
+/// `crate::hybrid::build_fts_query` to construct one safely from user
+/// free-text. An empty / None query short-circuits (caller skips FTS).
+///
+/// BM25 is FTS5's default ranking function; we don't expose the raw
+/// score because RRF fusion uses rank, not score. Returning ids in
+/// order is the contract.
+pub async fn fts_search(
+    db: &D1Database,
+    match_expr: &str,
+    limit: u32,
+) -> Result<Vec<String>> {
+    // Trim defensively: build_fts_query (our only current caller) can't
+    // produce whitespace-only output, but fts_search is pub and a future
+    // caller might. A whitespace-only MATCH expression would error on
+    // FTS5's syntax check rather than degenerating cleanly to empty.
+    let match_expr = match_expr.trim();
+    if match_expr.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[derive(serde::Deserialize)]
+    struct FtsHit {
+        id: String,
+    }
+    let rows: Vec<FtsHit> = db
+        .prepare(
+            "SELECT id FROM memories_fts
+             WHERE memories_fts MATCH ?
+             ORDER BY rank
+             LIMIT ?",
+        )
+        .bind(&[match_expr.into(), limit.into()])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
 }
 
 /// Memories filtered by entity, ranked by strength.
@@ -341,6 +497,341 @@ pub async fn recall_by_entity(
         .await?
         .results()?;
     Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// Episodics captured but not yet processed by Stage-1 encode (CLA-117).
+/// `integrated = 0`, oldest first so the pass clears the backlog FIFO. The
+/// trigger-agnostic `encode_one` consumes these whether driven by a queue
+/// consumer (per-write) or a nightly cron batch.
+pub async fn find_unintegrated_episodics(db: &D1Database, limit: u32) -> Result<Vec<Memory>> {
+    let rows: Vec<MemoryRow> = db
+        .prepare(
+            "SELECT id, memory_type, content, summary, created_at, last_accessed,
+                    access_count, strength, stability, entity, tags, image_hash,
+                    image_mime, recorded_by
+             FROM memories
+             WHERE memory_type = 'episodic' AND integrated = 0
+             ORDER BY created_at ASC
+             LIMIT ?",
+        )
+        .bind(&[limit.into()])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// Semantics that gained an inbound episodic edge since `since` (RFC3339) —
+/// i.e. subjects that came back onto the radar in that window (CLA-125). The
+/// orientation distiller's trigger: a fresh edge onto an *old* semantic counts,
+/// which is the whole point — currency is edge-recency, not the semantic's age.
+/// Excludes superseded; newest-created first; capped by `limit`.
+pub async fn find_semantics_edged_since(
+    db: &D1Database,
+    since: &str,
+    limit: u32,
+) -> Result<Vec<Memory>> {
+    let rows: Vec<MemoryRow> = db
+        .prepare(
+            "SELECT id, memory_type, content, summary, created_at, last_accessed,
+                    access_count, strength, stability, entity, tags, image_hash,
+                    image_mime, recorded_by
+             FROM memories
+             WHERE memory_type = 'semantic' AND superseded = 0
+               AND id IN (
+                   SELECT DISTINCT parent_id FROM consolidation_lineage
+                   WHERE edge_type = 'episodic_semantic' AND created_at >= ?
+               )
+             ORDER BY created_at DESC
+             LIMIT ?",
+        )
+        .bind(&[since.into(), limit.into()])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// Mark an episodic as processed by Stage-1 encode so the next pass skips it.
+pub async fn mark_integrated(db: &D1Database, id: &str) -> Result<()> {
+    db.prepare("UPDATE memories SET integrated = 1 WHERE id = ?")
+        .bind(&[id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+// ── Encode batch ledger + failure backstop (CLA-132) ────────────────────────
+// The async encode pipeline submits each capture as an Anthropic Message Batch
+// and dispatches the result from a delayed poll. `encode_batches` is the
+// in-flight ledger; `encode_failures` is the queryable record of episodics that
+// never landed (they stay unintegrated; `/admin/encode-run` re-submits them).
+
+#[derive(serde::Deserialize)]
+struct EncodeBatchSqlRow {
+    batch_id: String,
+    episodic_ids: String,
+    poll_count: i64,
+}
+
+/// One in-flight encode batch: the Anthropic batch id, the episodic ids it
+/// carries (custom_id = episodic_id), and how many times it's been polled.
+pub struct EncodeBatchRow {
+    pub batch_id: String,
+    pub episodic_ids: Vec<String>,
+    pub poll_count: i64,
+}
+
+/// Record a freshly-submitted batch as in-flight.
+pub async fn insert_encode_batch(
+    db: &D1Database,
+    batch_id: &str,
+    episodic_ids: &[String],
+) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    let ids_json = serde_json::to_string(episodic_ids).unwrap_or_else(|_| "[]".to_string());
+    db.prepare(
+        "INSERT INTO encode_batches (batch_id, status, episodic_ids, submitted_at, poll_count)
+         VALUES (?, 'in_progress', ?, ?, 0)",
+    )
+    .bind(&[batch_id.into(), ids_json.into(), now.into()])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Every batch still awaiting results, oldest first.
+pub async fn in_progress_encode_batches(db: &D1Database) -> Result<Vec<EncodeBatchRow>> {
+    let rows: Vec<EncodeBatchSqlRow> = db
+        .prepare(
+            "SELECT batch_id, episodic_ids, poll_count
+             FROM encode_batches WHERE status = 'in_progress'
+             ORDER BY submitted_at ASC",
+        )
+        .all()
+        .await?
+        .results()?;
+    Ok(rows
+        .into_iter()
+        .map(|r| EncodeBatchRow {
+            batch_id: r.batch_id,
+            episodic_ids: serde_json::from_str(&r.episodic_ids).unwrap_or_default(),
+            poll_count: r.poll_count,
+        })
+        .collect())
+}
+
+/// Move a batch to a terminal state ('dispatched' | 'failed'), stamping the poll.
+pub async fn set_encode_batch_status(db: &D1Database, batch_id: &str, status: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "UPDATE encode_batches SET status = ?, polled_at = ?, poll_count = poll_count + 1
+         WHERE batch_id = ?",
+    )
+    .bind(&[status.into(), now.into(), batch_id.into()])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Note a poll of a batch that's still open (bumps the counter for give-up logic).
+pub async fn bump_encode_batch_poll(db: &D1Database, batch_id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "UPDATE encode_batches SET polled_at = ?, poll_count = poll_count + 1
+         WHERE batch_id = ?",
+    )
+    .bind(&[now.into(), batch_id.into()])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Record an episodic whose encode failed to land — the queryable backstop
+/// (CLA-132). The episodic stays unintegrated; `/admin/encode-run` re-submits it.
+pub async fn record_encode_failure(
+    db: &D1Database,
+    episodic_id: &str,
+    batch_id: &str,
+    reason: &str,
+) -> Result<()> {
+    let failure_id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT INTO encode_failures (failure_id, episodic_id, batch_id, reason, failed_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&[
+        failure_id.into(),
+        episodic_id.into(),
+        batch_id.into(),
+        reason.into(),
+        now.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+// ── Encode diagnostics (CLA-132): forensic capture of each judge call ────────
+// One row per judge call, so an async first-submission whiff leaves its own
+// post-mortem. Sentinels instead of NULLs (-1 / "") keep the bind trivial — it's
+// a debug table, read by the admin endpoint, never by the hot path.
+
+/// A single judge-call autopsy. All concrete (sentinels, not NULLs).
+pub struct EncodeDiagnostic<'a> {
+    pub episodic_id: &'a str,
+    pub source: &'a str,
+    pub candidate_count: i64,
+    pub content_chars: i64,
+    pub http_status: i64,
+    pub stop_reason: String,
+    pub usage_in: i64,
+    pub usage_out: i64,
+    pub has_tool_use: bool,
+    pub content_types: String,
+    pub decision_count: i64,
+    pub note: String,
+}
+
+/// Record one judge-call autopsy. Best-effort at the call site (`let _`).
+pub async fn insert_encode_diagnostic(db: &D1Database, d: &EncodeDiagnostic<'_>) -> Result<()> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT INTO encode_diagnostics
+            (diag_id, episodic_id, source, candidate_count, content_chars, http_status,
+             stop_reason, usage_in, usage_out, has_tool_use, content_types,
+             decision_count, note, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&[
+        id.into(),
+        d.episodic_id.into(),
+        d.source.into(),
+        (d.candidate_count as i32).into(),
+        (d.content_chars as i32).into(),
+        (d.http_status as i32).into(),
+        d.stop_reason.as_str().into(),
+        (d.usage_in as i32).into(),
+        (d.usage_out as i32).into(),
+        (if d.has_tool_use { 1i32 } else { 0i32 }).into(),
+        d.content_types.as_str().into(),
+        (d.decision_count as i32).into(),
+        d.note.as_str().into(),
+        now.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// The N most recent autopsies, newest first — read by `/admin/encode-diagnostics`.
+#[derive(serde::Deserialize)]
+pub struct EncodeDiagRow {
+    pub episodic_id: String,
+    pub source: Option<String>,
+    pub candidate_count: Option<i64>,
+    pub content_chars: Option<i64>,
+    pub http_status: Option<i64>,
+    pub stop_reason: Option<String>,
+    pub usage_in: Option<i64>,
+    pub usage_out: Option<i64>,
+    pub has_tool_use: Option<i64>,
+    pub content_types: Option<String>,
+    pub decision_count: Option<i64>,
+    pub note: Option<String>,
+    pub created_at: String,
+}
+
+pub async fn recent_encode_diagnostics(db: &D1Database, limit: u32) -> Result<Vec<EncodeDiagRow>> {
+    let rows: Vec<EncodeDiagRow> = db
+        .prepare(
+            "SELECT episodic_id, source, candidate_count, content_chars, http_status,
+                    stop_reason, usage_in, usage_out, has_tool_use, content_types,
+                    decision_count, note, created_at
+             FROM encode_diagnostics ORDER BY created_at DESC LIMIT ?",
+        )
+        .bind(&[limit.into()])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows)
+}
+
+/// Write one provenance edge with explicit weight + type (CLA-117). Used for
+/// the encapsulated/link-only case (an episodic folded into an existing
+/// semantic with no change to it), and as the typed/weighted edge primitive
+/// generally. `edge_type` is functionally determined by the endpoints and
+/// validated by the caller. INSERT OR IGNORE so a re-run can't duplicate an
+/// edge — the PK is (parent_id, source_id).
+pub async fn add_lineage_edge(
+    db: &D1Database,
+    parent_id: &str,
+    source_id: &str,
+    weight: f64,
+    edge_type: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT OR IGNORE INTO consolidation_lineage
+            (parent_id, source_id, created_at, weight, edge_type)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&[
+        parent_id.into(),
+        source_id.into(),
+        now.into(),
+        weight.into(),
+        edge_type.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Migration pre-step (CLA-122): episodics already cited as a `source_id` in
+/// `consolidation_lineage` were consolidated under old REM, and `0008`
+/// backfilled their edges — so they are already "encoded" in the new model.
+/// Mark them integrated so the Stage-1 pass only touches the un-encoded
+/// backlog (reflections + whatever old REM skipped). Returns how many were
+/// marked.
+pub async fn mark_consolidated_episodics_integrated(db: &D1Database) -> Result<u64> {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        n: u64,
+    }
+    let row = db
+        .prepare(
+            "SELECT COUNT(*) AS n FROM memories
+             WHERE memory_type = 'episodic' AND integrated = 0
+               AND id IN (SELECT source_id FROM consolidation_lineage)",
+        )
+        .first::<CountRow>(None)
+        .await?;
+    let n = row.map(|r| r.n).unwrap_or(0);
+
+    db.prepare(
+        "UPDATE memories SET integrated = 1
+         WHERE memory_type = 'episodic' AND integrated = 0
+           AND id IN (SELECT source_id FROM consolidation_lineage)",
+    )
+    .run()
+    .await?;
+
+    Ok(n)
+}
+
+/// Flag a semantic as superseded by a newer one (CLA-117). The old view is
+/// kept in the store for completeness but excluded from tool surfacing (via
+/// the `superseded = 0` filter in `get_many`) — functionally the same as
+/// forgotten. `new_id` is the semantic that replaced it.
+pub async fn mark_superseded(db: &D1Database, old_id: &str, new_id: &str) -> Result<()> {
+    db.prepare("UPDATE memories SET superseded = 1, superseded_by = ? WHERE id = ?")
+        .bind(&[new_id.into(), old_id.into()])?
+        .run()
+        .await?;
+    Ok(())
 }
 
 /// N most recently created semantic memories. Used by the dialectic
@@ -400,6 +891,48 @@ pub async fn recent_semantics_not_recently_judged(
         .await?
         .results()?;
     Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// One row of the semantic layer for the cluster-preview diagnostic
+/// (CLA-134): id + summary + strength. We don't carry full content or the
+/// vector here — the vector is fetched from Vectorize by id, and the summary
+/// is enough to eyeball whether a proximity cluster is a genuine near-dupe.
+pub struct SemanticBrief {
+    pub id: String,
+    pub summary: String,
+    pub strength: f64,
+}
+
+/// Every live (non-superseded) semantic's id + summary + strength, oldest
+/// first. Read-only enumeration of the semantic layer for cluster-preview —
+/// the calibration pass that tunes the consolidation similarity threshold
+/// before any Haiku judgment or writes exist. `COALESCE(summary, '')` guards
+/// the handful of legacy rows that predate the summary column.
+pub async fn all_live_semantics(db: &D1Database) -> Result<Vec<SemanticBrief>> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        id: String,
+        summary: String,
+        strength: f64,
+    }
+    let rows: Vec<Row> = db
+        .prepare(
+            "SELECT id, COALESCE(summary, '') AS summary, strength
+             FROM memories
+             WHERE memory_type = 'semantic' AND superseded = 0
+             ORDER BY created_at ASC",
+        )
+        .all()
+        .await?
+        .results()?;
+    Ok(rows
+        .into_iter()
+        .map(|r| SemanticBrief {
+            id: r.id,
+            summary: r.summary,
+            strength: r.strength,
+        })
+        .collect())
 }
 
 /// Resolve an 8-char prefix (as shown in recall output) to a full UUID.
@@ -469,26 +1002,76 @@ pub async fn touch(db: &D1Database, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Update a memory's content + summary (after a re-embedding decision).
+/// Update a memory's content + summary, preserving the original first.
+///
+/// This is the only in-place-destructive path in the store, so the
+/// overwrite is bound to its own undo: an atomic D1 batch writes a
+/// `memory_revisions` audit row (carrying old_content/old_summary) in the
+/// SAME transaction as the UPDATE. Either both land or neither — the
+/// original can never be lost to a mis-targeted reframe (CLA-130). This
+/// generalises the dialectic's `memory_reframes` safety net to every
+/// caller, so none of them has to remember to preserve.
+///
+/// `source` names the caller ('encode' | 'orient' | 'reframe-tool' |
+/// 'reflect-tool') and `rationale` carries the judge's stated reason —
+/// the relationship gate — so a mis-fire can be read back against the
+/// content it touched. `None`/empty for the conscious MCP paths.
+///
 /// Does NOT touch the embedding — Vectorize upsert is the caller's job
 /// since we don't generate embeddings inside the store.
 pub async fn reframe(
     db: &D1Database,
     id: &str,
+    source: &str,
+    rationale: Option<&str>,
     new_content: &str,
     new_summary: &str,
 ) -> Result<bool> {
+    // Preserve the original before we overwrite it. If the row is already
+    // gone, there is nothing to reframe (and nothing to lose) — no-op.
+    let Some(original) = get(db, id).await? else {
+        return Ok(false);
+    };
+
     let now = chrono::Utc::now().to_rfc3339();
-    let result = db
+    let revision_id = Uuid::new_v4().to_string();
+
+    let update_stmt = db
         .prepare(
             "UPDATE memories
              SET content = ?, summary = ?, last_accessed = ?
              WHERE id = ?",
         )
-        .bind(&[new_content.into(), new_summary.into(), now.into(), id.into()])?
-        .run()
-        .await?;
-    Ok(result.meta().ok().flatten().and_then(|m| m.changes).unwrap_or(0) > 0)
+        .bind(&[
+            new_content.into(),
+            new_summary.into(),
+            now.clone().into(),
+            id.into(),
+        ])?;
+
+    let audit_stmt = db
+        .prepare(
+            "INSERT INTO memory_revisions
+                (revision_id, memory_id, source, rationale,
+                 old_content, old_summary, new_content, new_summary, revised_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&[
+            revision_id.into(),
+            id.into(),
+            source.into(),
+            rationale.unwrap_or("").into(),
+            original.content.into(),
+            original.summary.into(),
+            new_content.into(),
+            new_summary.into(),
+            now.into(),
+        ])?;
+
+    // Atomic: the destructive UPDATE can never commit without its undo row.
+    // On batch failure neither statement lands and the memory is untouched.
+    db.batch(vec![update_stmt, audit_stmt]).await?;
+    Ok(true)
 }
 
 /// Forget a memory — DELETE plus a tombstone row. Orientation memories
