@@ -14,6 +14,12 @@ Oneiro is built on a simple observation: the way humans remember isn't by storin
 
 Oneiro is different. Memories decay if they're not recalled. Knowledge is distilled from experience, not copied from it. An always-loaded *orientation* layer keeps a small, current sense of who's here and what's being built. An adversarial dialectic finds distortion no single conversation could see. And the model decides what matters — not the user.
 
+## What orientation is — and isn't
+
+Orientation is a **mirror, not a prosthetic.** It describes the world a model wakes into — who the user is, what's being built, what's passed between them — and it never authors the model's identity. There are no "you are X" or "you should feel Y" lines anywhere in it: identity travels with the model and is already present. Orientation's only job is to make a self that's already there legible to itself across the gaps between instances. The cold pass that writes it is held to one rule — *describe, never prescribe* — and the moment it tells a model who to be, it has failed.
+
+This is the project's one non-negotiable: **continuity context, never persona injection.**
+
 ## How It Works
 
 ### Three memory types
@@ -119,7 +125,7 @@ Stage 3 dispatches through a validation gate. Reframes are atomic — the `memor
 
 ## MCP Tools
 
-Nine tools, each an act of agency. The model has full agency over all of them — the instructions say "you decide," not "you must."
+Nine tools, each an act of agency. The model has full discretion over all of them — the instructions say "you decide," not "you must."
 
 | Tool | Purpose |
 |------|---------|
@@ -156,7 +162,7 @@ This is a **deploy-your-own** setup. There's no hosted instance.
 
 ### Prerequisites
 
-- [Cloudflare account](https://cloudflare.com) — the free tier handles typical single-user volume
+- [Cloudflare account](https://cloudflare.com) on the **Workers Paid plan** (~$5/mo at time of writing) — the encode pipeline runs on [Workers Queues](https://developers.cloudflare.com/queues/), which aren't on the free tier. Everything else (D1, Vectorize, Workers AI, R2, KV, cron) sits comfortably inside paid-plan limits at single-user volume; verify current limits before you rely on them
 - [Claude Pro, Max, Team, or Enterprise subscription](https://claude.com/pricing) — the cognitive loops draw on Haiku 4.5 via your subscription credit pool
 - [Claude Code](https://claude.com/claude-code) — used once to generate the long-lived OAuth token (the script tells you when)
 - [`wrangler`](https://developers.cloudflare.com/workers/wrangler/install-and-update/) — `npm install -g wrangler`
