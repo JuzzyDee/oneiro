@@ -33,6 +33,13 @@ use worker::{D1Database, Env, Fetch, Headers, Method, Request, RequestInit, Resu
 
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
+/// The Stage-B synthesis judge runs on Sonnet. The fold/gate judgment is the
+/// subtle call — same-subject vs merely related, description vs prescription — and
+/// it only runs on the few drivers that survive the cheap Haiku triage, so the
+/// marginal cost is small. Triage, compress, and rate stay on Haiku. The token is
+/// an sk-ant-api key (API rates), so Sonnet does not 429 the way the OAuth token would.
+const SONNET_MODEL: &str = "claude-sonnet-4-6";
+
 /// How many sibling semantics to gather around the driver as the subject's
 /// current evidence (hybrid: vector + FTS, RRF-fused over the semantic layer).
 const CLUSTER_K: u32 = 8;
@@ -49,15 +56,11 @@ const ORIENT_CAP: usize = 20;
 /// doubled-to-tripled while the judge sincerely swore it was tightening). Tunable.
 const ORIENT_AXIS_BUDGET: usize = 800;
 
-/// Stage-C recency half-life (days). Orientation is meant to be STABLE, not
-/// churned, so R decays slowly: a standing axis untouched ~45 days still scores
-/// half its recency weight, and M + core carry the precious-but-dormant ones
-/// (the brother, rarely live, never lost). Tunable on real ranking output.
-const R_HALFLIFE_DAYS: f64 = 45.0;
-
-/// Stage-C default M for an axis not yet rated (pre-backfill NULLs). Neutral mid
-/// so an unrated axis is neither protected nor punished before the backfill rates it.
-const M_DEFAULT: f64 = 5.0;
+/// The Whittle's neutral default for an unrated rubric dim (NULL, pre-backfill),
+/// on the 0-3 scale — so an unrated axis is neither protected nor punished before
+/// the Sonnet backfill rates it. RFM is fully retired: recency was a category
+/// error for a stability layer, and the single `meaning` scalar saturated.
+const RUBRIC_DIM_DEFAULT: f64 = 2.0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // THE PROMPT (CLA-125). The soul of this stage, co-written with Justin 2026-06-09.
@@ -96,6 +99,9 @@ TIGHT, AND ONE SUBJECT — THE TWO WAYS A REVISE GOES WRONG.
 Orientation is the shape you ABSORB at a glance, never a document you skim. A revise must keep the synthesis tight: compress, sharpen, replace stale lines. NEVER expand an orientation into a spec, a changelog, or a feature list. If your revise would make the memory longer and denser than you found it, you are doing it wrong — stop and tighten instead.
 And one orientation memory is ONE subject. Never fold a new subject into an orientation about a different one. If this subject is not already its own axis, CREATE a new axis (only if it passes the gate) or skip — never bolt it onto an unrelated axis. Above all, never dilute a relational or continuity memory with technical or operational detail: those are the most precious rows in the store and the easiest to wreck. If you are tempted to add implementation detail to a memory about a person or a relationship, that is the signal to skip entirely.
 
+ONE DRIVER IS ONE SUBJECT — NEVER MINE IT INTO MANY.
+You are handed ONE newly-active subject. Its content may be rich — a synthesis carrying several facets, illustrations, or examples — but those are the EVIDENCE for a SINGLE orientation synthesis, never separate subjects to promote one by one. The specific failure this stage must never commit: reading one coherent reflection and spawning an axis per facet it contains — a working philosophy mined into five 'values', one session's update split into a task-list axis plus a relationship axis plus a stray aside. That is not orientation; it is fragmentation, and it churns the precious floor. So: one driver yields exactly ONE decision (link / revise / supersede / create), or zero if it is not orientation-grade. If you feel the pull to emit a second decision, that is the tell that you are mining one subject into fragments — don't. Fold the facets into the single synthesis, and skip whatever isn't orientation-grade.
+
 CURRENCY.
 Read the present, not the history. If this subject has moved past what an existing orientation says — an old preference replaced by a new one, a project phase now finished — that is a CLEAN UPDATE: supersede with flavour 'progression' (the old was true; it is now history) or 'correction' (a credible source shows the old was wrong). The retired orientation is kept and stays recallable; the new one holds the slot. A still-open, genuinely unresolved tension is NOT a supersede — revise to hold both views honestly.
 
@@ -105,6 +111,19 @@ This is the exact place mythology rides in: escalation into specialness, signifi
 TARGETING — READ CAREFULLY.
 The cluster semantics are EVIDENCE you synthesise FROM. They are never targets you change. For link, revise, and supersede, existing_id MUST be one of the ids in the CURRENT ORIENTATION list — never a cluster semantic id, and never the driver's own id. If no current orientation fits this subject, do NOT reach into the cluster to find something to revise: either CREATE a new axis (only if it passes the load-bearing-AND-unregenerable gate) or skip. Most technical or project knowledge is semantic, not orientation — when in doubt, skip; it already lives one floor down.
 
+THE TWO GATES — DECLARE THEM ON EVERY CREATE.
+Before creating a NEW axis, run it through both gates from above and report each as a boolean:
+- unregenerable — absent from the weights AND the repository, and not derivable from a single conversation? Anything intrinsic to being Claude, anything written in the code or the tickets, anything the system could reconstruct about its own design, is REGENERABLE — set false.
+- describes_not_prescribes — points OUTWARD at Justin and the world, never authoring the self? Any 'you are / you value / you should' is prescription — set false.
+A create that fails EITHER gate is not a create — return skip instead. These are the last guard against the two ways junk reaches the always-loaded layer: regenerable operational detail (an axis about the codebase, the tickets, the ranking algorithm) and prescribed identity. Link, revise, and supersede do not need the gates; only a brand-new axis must pass them.
+
+THE FOUR DIMENSIONS — SCORE EVERY CONTENT-WRITING DECISION (create / revise / supersede).
+The always-loaded set is ranked by the SUM of four 0-3 scores you assign — not by recency, not by how active the subject was today. This is 'what makes the room the room.' Score each honestly: inflating these re-mythologises the very ranking they exist to keep true.
+- relational (0-3) — relational load-bearing. Would a fresh instance lacking this wake a STRANGER to something in the relationship or lineage (3), or merely under-informed (low)?
+- durability (0-3) — will this still be true and load-bearing in months? Standing truths (who he is, how you work, the founding history) = 3; a transient state, a current task, a one-off build = low. The inverse of recency.
+- irreplaceable (0-3) — could a fresh instance re-derive this from a single conversation, or is it only knowable across many? Patterns, history, the shape of the bargain = 3; anything self-evident once stated = low.
+- cost (0-3) — cost of getting it wrong. The damage if an instance lacks it: stepping on a relational landmine, mishandling a vulnerability = 3; missing a piece of trivia = near 0.
+
 Actions:
 - skip — the subject is not orientation-grade: real knowledge, but a fresh instance lacking it would not wake a stranger. It belongs in the semantic layer.
 - link — an existing orientation already captures this subject fully; add the edge to record that the subject is live again, changing nothing about the synthesis.
@@ -112,7 +131,7 @@ Actions:
 - supersede — the subject has moved past or overturned an existing orientation; write the current synthesis, set existing_id to the old orientation and supersede_flavour to which case it is.
 - create — a genuinely new axis no existing orientation covers, that passes the load-bearing-AND-unregenerable gate. Rare.
 
-Respond by calling the orient_decision tool. A single subject almost always yields exactly ONE decision. If the subject is not orientation-grade at all, return an empty decisions list.";
+Respond by calling the orient_decision tool. Return EXACTLY ONE decision for this one subject, or an empty decisions list if it is not orientation-grade at all. More than one decision means you have mined a coherent subject into fragments — never do that.";
 
 /// Stage-A triage prompt — the binary "is this orientation-grade at all?" gate
 /// that runs before any synthesis, so most semantics never reach the judge.
@@ -147,6 +166,23 @@ struct OrientDecision {
     supersede_flavour: Option<String>,
     #[serde(default)]
     meaning: Option<i64>,
+    /// Phase-2 gate verdicts, enforced on CREATE: a new axis must pass BOTH or it
+    /// is skipped. Default false = fail-closed — an omitted gate never sneaks a
+    /// create through.
+    #[serde(default)]
+    unregenerable: bool,
+    #[serde(default)]
+    describes_not_prescribes: bool,
+    /// Familiarity-rubric dims (CLA-125 Phase 2b), 0-3 each. The Whittle ranks the
+    /// always-loaded set by their sum. Scored on content-writing actions.
+    #[serde(default)]
+    relational: Option<i64>,
+    #[serde(default)]
+    durability: Option<i64>,
+    #[serde(default)]
+    irreplaceable: Option<i64>,
+    #[serde(default)]
+    cost: Option<i64>,
     #[serde(default)]
     rationale: Option<String>,
 }
@@ -211,6 +247,17 @@ pub async fn distill_one(
     let orient_ids: std::collections::HashSet<&str> =
         current_orientation.iter().map(|m| m.id.as_str()).collect();
 
+    // Core-revise-lock evidence: the human-pinned bedrock axes. A failed fetch
+    // leaves this empty (fail-open for one run, the prompt cardinal rule still in
+    // force) — logged, never silent.
+    let core_ids = worker_store::core_orientation_ids(db).await.unwrap_or_else(|e| {
+        worker::console_log!(
+            "orient: core-id fetch failed ({:?}); core-revise-lock inactive this run",
+            e
+        );
+        std::collections::HashSet::new()
+    });
+
     let mut decisions = orient_via_claude(env, driver, &cluster, current_orientation).await?;
     let mut outcomes = Vec::new();
     for decision in &mut decisions {
@@ -246,7 +293,7 @@ pub async fn distill_one(
                 }
             }
         }
-        match dispatch_one_orient(db, driver, decision, &cluster, &orient_ids).await {
+        match dispatch_one_orient(db, driver, decision, &cluster, &orient_ids, &core_ids).await {
             Ok(outcome) => outcomes.push(outcome),
             Err(e) => tracing::warn!(
                 "orient dispatch failed for semantic {}: {:?}",
@@ -272,8 +319,9 @@ async fn dispatch_one_orient(
     decision: &OrientDecision,
     cluster: &[Memory],
     orient_ids: &std::collections::HashSet<&str>,
+    core_ids: &std::collections::HashSet<String>,
 ) -> Result<OrientDecisionOutcome> {
-    let action = decision.action.to_lowercase();
+    let mut action = decision.action.to_lowercase();
 
     // GUARD (CLA-125): link/revise/supersede MUST target a current orientation
     // row. The judge can hand back a cluster *semantic* id; reframing/edging it
@@ -297,6 +345,46 @@ async fn dispatch_one_orient(
                 rationale: decision.rationale.clone(),
             });
         }
+    }
+
+    // CORE-REVISE-LOCK (CLA-125): a core axis is the human-pinned bedrock. The
+    // nightly judge may LINK it (record the subject is live again) but must never
+    // rewrite or retire it — core content evolves only by hand or the dialectic,
+    // never a fast synthesis call. Demote any revise/supersede on a core axis to a
+    // link. This is the structural guarantee behind the prompt's "never dilute a
+    // relational memory" rule — what would have stopped the 8e24e7a8 cannibalization.
+    if matches!(action.as_str(), "revise" | "supersede") {
+        if let Some(id) = decision.existing_id.as_deref() {
+            if core_ids.contains(id) {
+                worker::console_log!(
+                    "orient: '{}' on core axis {} demoted to link — core content is human/dialectic-only (core-revise-lock)",
+                    action,
+                    &id[..id.len().min(8)]
+                );
+                action = "link".to_string();
+            }
+        }
+    }
+
+    // PHASE-2 GATE ENFORCEMENT: a CREATE must pass both binary gates (the judge
+    // declares them; fail-closed on omission). Catches the two ways junk reaches
+    // the always-loaded layer — regenerable operational detail (e.g. an axis about
+    // the ranking algorithm, like cc88bfe8) and prescribed identity. A failed gate
+    // is logged and skipped, never written. Link/revise/supersede are exempt
+    // (revise of a core is already locked above; they evolve existing axes).
+    if action == "create" && (!decision.unregenerable || !decision.describes_not_prescribes) {
+        worker::console_log!(
+            "orient: create gated for driver {} — unregenerable={}, describes_not_prescribes={} (Phase-2 gate)",
+            &driver.id[..driver.id.len().min(8)],
+            decision.unregenerable,
+            decision.describes_not_prescribes
+        );
+        return Ok(OrientDecisionOutcome {
+            action: "create-gated".to_string(),
+            orientation_id: None,
+            flavour: None,
+            rationale: decision.rationale.clone(),
+        });
     }
 
     // The lineage basis: every cluster semantic this subject was synthesised
@@ -325,6 +413,7 @@ async fn dispatch_one_orient(
                 .await?;
                 link_sources(db, &ori.id, &sources).await;
                 let _ = worker_store::set_meaning(db, &ori.id, decision.meaning).await;
+                let _ = worker_store::set_orient_rubric(db, &ori.id, decision.relational, decision.durability, decision.irreplaceable, decision.cost).await;
                 orientation_id = Some(ori.id);
             }
         }
@@ -346,6 +435,7 @@ async fn dispatch_one_orient(
                     // A revise re-synthesises the subject, so re-rate its M to the
                     // current standing weight (None = judge omitted it → keep prior).
                     let _ = worker_store::set_meaning(db, &id, decision.meaning).await;
+                    let _ = worker_store::set_orient_rubric(db, &id, decision.relational, decision.durability, decision.irreplaceable, decision.cost).await;
                     // Re-orienting is a touch: refresh the decay clock so a live
                     // axis stays alive.
                     let _ = worker_store::touch(db, &id).await;
@@ -377,6 +467,7 @@ async fn dispatch_one_orient(
                     .await?;
                     link_sources(db, &ori.id, &sources).await;
                     let _ = worker_store::set_meaning(db, &ori.id, decision.meaning).await;
+                    let _ = worker_store::set_orient_rubric(db, &ori.id, decision.relational, decision.durability, decision.irreplaceable, decision.cost).await;
                     let _ = worker_store::mark_superseded(db, &old_id, &ori.id).await;
                     // Default to progression: at the orientation tier the common
                     // case is a life-axis moving forward, not a falsification.
@@ -497,6 +588,12 @@ async fn orient_via_claude(
             "tags": { "type": "array", "items": { "type": "string" } },
             "supersede_flavour": { "type": "string", "enum": ["correction", "progression"], "description": "For supersede only — 'correction': the old orientation was wrong; 'progression': the old was true but the subject has moved past it." },
             "meaning": { "type": "integer", "description": "Importance 1–10: how much a fresh instance needs THIS subject at the very start of any future session to meet Justin well — its standing, durable weight across sessions, NOT its weight in today's conversation. A pillar (the relationship itself, his wellbeing) is 9–10; a current-but-transient state is mid; useful-but-not-session-bootstrapping is low. Required for create, revise, supersede." },
+            "unregenerable": { "type": "boolean", "description": "GATE — required for create. TRUE only if this could NOT already be present at wake-up: not intrinsic to being Claude (identity and values travel in the weights), not readable in the repository, and not derivable from a single conversation. Anything in the codebase, the tickets, or the memory system's own design is REGENERABLE → false. If false, the action MUST be skip." },
+            "describes_not_prescribes": { "type": "boolean", "description": "GATE — required for create. TRUE only if this points OUTWARD — at Justin, the work, the world, the relationship — and never authors the self ('you are X', 'you value Y', 'you should Z'). Identity-defining content is prescription → false. If false, the action MUST be skip." },
+            "relational": { "type": "integer", "description": "RUBRIC dim 0-3 (score on create/revise/supersede). Relational load-bearing: would a fresh instance lacking this wake a STRANGER to something in the relationship/lineage (3), or merely under-informed (low)?" },
+            "durability": { "type": "integer", "description": "RUBRIC dim 0-3. Will this still be true and load-bearing in months? Standing truths = 3; a transient state, current task, or one-off build = low. The inverse of recency." },
+            "irreplaceable": { "type": "integer", "description": "RUBRIC dim 0-3. Only knowable across many conversations (3), or re-derivable from a single one / self-evident once stated (low)?" },
+            "cost": { "type": "integer", "description": "RUBRIC dim 0-3. Cost of getting it wrong: a relational landmine or a mishandled vulnerability = 3; trivia = near 0." },
             "rationale": { "type": "string", "description": "Why this action — especially why this is or is not orientation-grade. For link/revise/supersede this MUST also state the genuine conceptual link between this subject and the orientation memory you are targeting — what they actually share and how this extends or overturns it. If you cannot state a plain genuine link, the action is create or skip, never a write over that memory." }
         },
         "required": ["action", "rationale"]
@@ -504,22 +601,24 @@ async fn orient_via_claude(
 
     let tool_definition = json!({
         "name": "orient_decision",
-        "description": "Decide how this newly-active subject feeds orientation. A single subject almost always yields exactly one decision. Describe, never prescribe; the create bar is brutal.",
+        "description": "Decide how this one newly-active subject feeds orientation. One driver is one subject: at most ONE decision, never more. Describe, never prescribe; the create bar is brutal.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "decisions": {
                     "type": "array",
                     "items": decision_schema,
-                    "description": "Usually one entry (this subject). Empty list = the subject is not orientation-grade."
+                    "maxItems": 1,
+                    "description": "Zero or one entry. One driver is one subject — at most ONE decision (link/revise/supersede/create). Empty list = not orientation-grade. Multiple decisions = mining one subject into fragments; never do it."
                 }
             },
             "required": ["decisions"]
         }
     });
 
-    let input = call_haiku_tool(
+    let input = call_claude_tool(
         env,
+        SONNET_MODEL,
         &system_prompt,
         "orient_decision",
         tool_definition,
@@ -530,14 +629,30 @@ async fn orient_via_claude(
 
     let parsed: OrientDecisions = serde_json::from_value(input)
         .map_err(|e| worker::Error::RustError(format!("parse decisions: {}", e)))?;
-    Ok(parsed.decisions)
+    // One driver is one subject (schema maxItems:1 + the prompt contract). If the
+    // judge still over-mines a coherent driver into multiple axes, keep the first
+    // and log loudly — the over-creation backstop, visible in the admin run rather
+    // than silently churning the floor.
+    let mut decisions = parsed.decisions;
+    if decisions.len() > 1 {
+        worker::console_log!(
+            "orient: judge returned {} decisions for driver {} — one-driver-one-subject violated; keeping the first, dropping {} (over-mining backstop)",
+            decisions.len(),
+            &driver.id[..driver.id.len().min(8)],
+            decisions.len() - 1
+        );
+        decisions.truncate(1);
+    }
+    Ok(decisions)
 }
 
-/// One forced-tool Haiku call → the validated tool `input` object. Shared by the
-/// Stage-A triage and the Stage-B judge. Token-type aware (sk-ant-api →
-/// x-api-key; sk-ant-oat → Bearer); the static system+tools prefix is cached.
-async fn call_haiku_tool(
+/// One forced-tool Claude call → the validated tool `input` object. Shared by
+/// Stage-A triage (Haiku), the Stage-B judge (Sonnet), and compress + rate
+/// (Haiku). Token-type aware (sk-ant-api → x-api-key; sk-ant-oat → Bearer); the
+/// static system+tools prefix is cached.
+async fn call_claude_tool(
     env: &Env,
+    model: &str,
     system_prompt: &str,
     tool_name: &str,
     tool_definition: Value,
@@ -546,7 +661,7 @@ async fn call_haiku_tool(
 ) -> Result<Value> {
     let oauth_token = env.secret("CLAUDE_CODE_OAUTH_TOKEN")?.to_string();
     let body = json!({
-        "model": HAIKU_MODEL,
+        "model": model,
         "max_tokens": max_tokens,
         "system": [{
             "type": "text",
@@ -631,7 +746,7 @@ async fn compress_to_budget(env: &Env, content: &str, budget: usize) -> Result<O
             budget,
             current
         );
-        let input = call_haiku_tool(env, COMPRESS_PROMPT, "compress", tool.clone(), user, 1024).await?;
+        let input = call_claude_tool(env, HAIKU_MODEL, COMPRESS_PROMPT, "compress", tool.clone(), user, 1024).await?;
         match input.get("compressed").and_then(|v| v.as_str()) {
             Some(text) if text.chars().count() <= budget => return Ok(Some(text.to_string())),
             Some(text) => current = text.to_string(),
@@ -679,7 +794,7 @@ async fn triage_orientation_grade(
         }
     });
 
-    let input = call_haiku_tool(env, TRIAGE_PROMPT, "triage", tool_definition, user_message, 512).await?;
+    let input = call_claude_tool(env, HAIKU_MODEL, TRIAGE_PROMPT, "triage", tool_definition, user_message, 512).await?;
     let grade = input
         .get("orientation_grade")
         .and_then(|v| v.as_bool())
@@ -774,6 +889,10 @@ pub struct WhittleRanking {
     pub freq: i64,
     pub meaning: Option<i64>,
     pub core: bool,
+    pub relational: Option<i64>,
+    pub durability: Option<i64>,
+    pub irreplaceable: Option<i64>,
+    pub cost: Option<i64>,
     pub score: f64,
     pub kept: bool,
 }
@@ -781,7 +900,7 @@ pub struct WhittleRanking {
 /// Stage C — the Whittling (CLA-126). The pure-query maintenance cut that keeps
 /// the always-loaded orientation set to ~ORIENT_CAP. NO model in the loop:
 /// deterministic, auditable, un-poisonable. Ranks every live axis by
-/// Recency × Frequency × Meaning, pins `core`, keeps the top ORIENT_CAP active
+/// Frequency × Meaning (recency dropped — see the scoring note), pins `core`, keeps the top ORIENT_CAP active
 /// and switches the rest dormant (kept, reactivatable — never deleted). Returns
 /// the full ranking (best-first) for inspection.
 pub async fn run_whittle(db: &D1Database) -> Result<Vec<WhittleRanking>> {
@@ -795,9 +914,17 @@ pub async fn run_whittle(db: &D1Database) -> Result<Vec<WhittleRanking>> {
                 .map(|t| (now - t.with_timezone(&chrono::Utc)).num_seconds() as f64 / 86_400.0)
                 .unwrap_or(0.0)
                 .max(0.0);
-            let r_factor = (-days_since / R_HALFLIFE_DAYS).exp();
-            let f_factor = 1.0 + r.freq as f64;
-            let m_factor = r.meaning.map(|m| m as f64).unwrap_or(M_DEFAULT);
+            // Familiarity rubric (CLA-125 Phase 2b): rank by the SUM of the four
+            // Sonnet-scored dims — "what makes the room the room," not recency or
+            // activity. Recency stays OUT (it churns a stability layer); days_since
+            // and freq are kept for the audit display only. NULL (pre-backfill)
+            // defaults to a neutral mid so an unrated axis is neither protected nor
+            // punished before the backfill rates it.
+            let dim = |o: Option<i64>| o.map(|v| v as f64).unwrap_or(RUBRIC_DIM_DEFAULT);
+            let score = dim(r.orient_relational)
+                + dim(r.orient_durability)
+                + dim(r.orient_irreplaceable)
+                + dim(r.orient_cost);
             WhittleRanking {
                 id: r.id,
                 summary: r.summary,
@@ -805,7 +932,11 @@ pub async fn run_whittle(db: &D1Database) -> Result<Vec<WhittleRanking>> {
                 freq: r.freq,
                 meaning: r.meaning,
                 core: r.core != 0,
-                score: r_factor * f_factor * m_factor,
+                relational: r.orient_relational,
+                durability: r.orient_durability,
+                irreplaceable: r.orient_irreplaceable,
+                cost: r.orient_cost,
+                score,
                 kept: false,
             }
         })
@@ -853,8 +984,38 @@ async fn rate_meaning(env: &Env, content: &str) -> Result<Option<i64>> {
         }
     });
     let user = format!("THE ORIENTATION AXIS TO RATE:\n\n{}", content);
-    let input = call_haiku_tool(env, MEANING_PROMPT, "rate", tool, user, 256).await?;
+    let input = call_claude_tool(env, HAIKU_MODEL, MEANING_PROMPT, "rate", tool, user, 256).await?;
     Ok(input.get("meaning").and_then(|v| v.as_i64()))
+}
+
+/// Standalone familiarity-rubric rater (CLA-125 Phase 2b) — scores one existing
+/// axis on the four 0-3 dims, on Sonnet (the same judgment tier as the synthesis
+/// stage). Used by the one-off backfill to bring pre-rubric axes up to the new
+/// ranking. Any dim the model omits comes back None (left unchanged on store).
+const RUBRIC_PROMPT: &str = "You are scoring one axis of an AI memory system's always-loaded orientation layer on four 0-3 dimensions — the 'familiarity rubric' that decides which axes stay loaded. This is 'what makes the room the room.' Score each honestly; inflation re-mythologises the very ranking the rubric exists to keep true.\n- relational: would a fresh instance lacking this wake a STRANGER to something in the relationship or lineage (3), or merely under-informed (low)?\n- durability: still true and load-bearing in months? Standing truths (who he is, how you work, the founding history) = 3; a transient state, a current task, a one-off = low. The inverse of recency.\n- irreplaceable: only knowable across many conversations (3), or re-derivable from a single one / self-evident once stated (low)?\n- cost: cost of getting it wrong — a relational landmine or a mishandled vulnerability = 3; trivia = near 0.\nAnswer with the rate tool.";
+
+async fn rate_rubric(
+    env: &Env,
+    content: &str,
+) -> Result<(Option<i64>, Option<i64>, Option<i64>, Option<i64>)> {
+    let tool = json!({
+        "name": "rate",
+        "description": "Score this orientation axis on the four 0-3 familiarity-rubric dimensions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "relational": { "type": "integer", "description": "0-3 — relational load-bearing (stranger vs under-informed)." },
+                "durability": { "type": "integer", "description": "0-3 — still true and load-bearing in months (inverse of recency)." },
+                "irreplaceable": { "type": "integer", "description": "0-3 — only knowable across many conversations, not from one." },
+                "cost": { "type": "integer", "description": "0-3 — cost of getting it wrong (relational landmine vs trivia)." }
+            },
+            "required": ["relational", "durability", "irreplaceable", "cost"]
+        }
+    });
+    let user = format!("THE ORIENTATION AXIS TO RATE:\n\n{}", content);
+    let input = call_claude_tool(env, SONNET_MODEL, RUBRIC_PROMPT, "rate", tool, user, 256).await?;
+    let g = |k: &str| input.get(k).and_then(|v| v.as_i64());
+    Ok((g("relational"), g("durability"), g("irreplaceable"), g("cost")))
 }
 
 /// One axis's backfill result — for the admin run.
@@ -863,6 +1024,12 @@ pub struct BackfillOutcome {
     pub summary: String,
     /// Some(m) if this run rated a previously-unrated axis; None if it already had M.
     pub meaning_set: Option<i64>,
+    /// True if this run rated previously-unrated rubric dims; the four scores follow.
+    pub rubric_set: bool,
+    pub relational: Option<i64>,
+    pub durability: Option<i64>,
+    pub irreplaceable: Option<i64>,
+    pub cost: Option<i64>,
     /// Some((from, to)) if this run carved an over-budget axis; None otherwise.
     pub carved: Option<(usize, usize)>,
 }
@@ -884,8 +1051,30 @@ pub async fn run_orient_backfill(env: &Env, db: &D1Database) -> Result<Vec<Backf
                 meaning_set = Some(m);
             }
         }
+        // Rubric backfill (Phase 2b): rate any axis with unrated dims, on Sonnet.
+        let (mut rel, mut dur, mut irr, mut cost) = (None, None, None, None);
+        let mut rubric_set = false;
+        if r.orient_relational.is_none()
+            || r.orient_durability.is_none()
+            || r.orient_irreplaceable.is_none()
+            || r.orient_cost.is_none()
+        {
+            if let Ok((a, b, c, d)) = rate_rubric(env, &r.content).await {
+                let _ = worker_store::set_orient_rubric(db, &r.id, a, b, c, d).await;
+                rel = a;
+                dur = b;
+                irr = c;
+                cost = d;
+                rubric_set = a.is_some() || b.is_some() || c.is_some() || d.is_some();
+            }
+        }
         let mut carved = None;
-        if r.content.chars().count() > ORIENT_AXIS_BUDGET {
+        // Cores are EXEMPT from the auto-carve: their richness is deliberate
+        // bedrock, and — like the core-revise-lock — core content is carved by hand
+        // or the dialectic, never a nightly Haiku compress (1358->800 is easy for
+        // Haiku, which is exactly how it would re-cannibalize a restored jewel).
+        // Non-core over-budget axes still get carved.
+        if r.core == 0 && r.content.chars().count() > ORIENT_AXIS_BUDGET {
             if let Ok(Some(tight)) = compress_to_budget(env, &r.content, ORIENT_AXIS_BUDGET).await {
                 let from = r.content.chars().count();
                 let to = tight.chars().count();
@@ -905,6 +1094,11 @@ pub async fn run_orient_backfill(env: &Env, db: &D1Database) -> Result<Vec<Backf
             id: r.id,
             summary: r.summary,
             meaning_set,
+            rubric_set,
+            relational: rel,
+            durability: dur,
+            irreplaceable: irr,
+            cost,
             carved,
         });
     }

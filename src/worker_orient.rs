@@ -60,7 +60,7 @@ pub fn format_payload(
         if !recent_memories.is_empty() {
             out.push_str("── Recent ──\n");
             for m in recent_memories {
-                out.push_str(&format_memory(m));
+                out.push_str(&format_memory_brief(m));
             }
         }
     }
@@ -72,15 +72,11 @@ pub fn format_payload(
     out
 }
 
-/// Format a single memory as a one-block text entry. Shared with
-/// `worker_mcp` so the same memory looks the same wherever it surfaces.
-///
-/// Format: `[type | age | str:X.XX | entity | id:prefix [tags] via:source]\n<content>\n`
-///
+/// The `[type | age | str | entity | id:prefix [tags] via:source img]` header
+/// line, shared by the full and brief renderers below so they can never drift.
 /// The 8-char id prefix is what callers reference in `recall_specific`,
-/// `reframe`, `forget` — short enough to retype, long enough to be
-/// unambiguous in the current store.
-pub(crate) fn format_memory(m: &Memory) -> String {
+/// `reframe`, `forget` — short enough to retype, long enough to be unambiguous.
+fn format_header(m: &Memory) -> String {
     let type_label = m.memory_type.as_str();
     let entity_str = m.entity.as_deref().unwrap_or("");
     let tags_str = if m.tags.is_empty() {
@@ -103,20 +99,23 @@ pub(crate) fn format_memory(m: &Memory) -> String {
         .unwrap_or_default();
     // Image indicator — terse so it doesn't bloat the header. The reader
     // sees `img` and knows recall_image will succeed against this id.
-    // Without it: the "I came home excited about a photo" workflow
-    // forces speculative recall_image calls to discover which candidate
-    // carries the bytes.
     let img = if m.image_hash.is_some() { " | img" } else { "" };
     format!(
-        "[{} | {} | str:{:.2} | {} | id:{}{}{}{}]\n{}\n",
-        type_label,
-        age_str,
-        m.strength,
-        entity_str,
-        &m.id[..8],
-        tags_str,
-        by,
-        img,
-        m.content
+        "[{} | {} | str:{:.2} | {} | id:{}{}{}{}]",
+        type_label, age_str, m.strength, entity_str, &m.id[..8], tags_str, by, img
     )
+}
+
+/// Header + full `content`. For orientation (the always-loaded axes — you want
+/// their whole text), and anywhere a complete memory should render. Shared with
+/// `worker_mcp` so the same memory looks the same wherever it surfaces.
+pub(crate) fn format_memory(m: &Memory) -> String {
+    format!("{}\n{}\n", format_header(m), m.content)
+}
+
+/// Header + one-line `summary` only. For the "Recent" surface, which shows the
+/// distilled semantics of the last capture and must stay light — full content
+/// there would re-bloat the exact thing recall_orient exists to keep small.
+pub(crate) fn format_memory_brief(m: &Memory) -> String {
+    format!("{}\n{}\n", format_header(m), m.summary)
 }
