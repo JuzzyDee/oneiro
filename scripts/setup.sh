@@ -2,10 +2,10 @@
 # scripts/setup.sh — one-command deploy for oneiro (CLA-96).
 #
 # Walks a new operator from `git clone` to a working Cloudflare Worker
-# in one script. Creates D1 / Vectorize / KV / R2, generates OAuth
-# credentials, prompts for the long-lived Claude Code OAuth token,
-# configures cron triggers for the user's timezone, pushes secrets,
-# applies migrations, deploys.
+# in one script. Creates D1 / Vectorize / KV / Queues / R2, generates
+# OAuth credentials, prompts for an Anthropic API key, configures cron
+# triggers for the user's timezone, pushes secrets, applies migrations,
+# deploys.
 #
 # Designed for the audience already familiar with Claude but not
 # necessarily with Cloudflare. Assumes wrangler is installed and the
@@ -156,18 +156,19 @@ toml_set_after_marker() {
     ' wrangler.toml > wrangler.toml.tmp && mv wrangler.toml.tmp wrangler.toml
 }
 
-# Replace the crons line.
+# Replace the crons line with the 3-job nightly roster: CSCC, orient, dialectic.
 toml_set_crons() {
-    local rem_cron="$1"
-    local dialectic_cron="$2"
+    local cscc_cron="$1"
+    local orient_cron="$2"
+    local dialectic_cron="$3"
     if [ "$DRY_RUN" = true ]; then
-        printf '  %s[dry-run]%s would set crons = ["%s", "%s"]\n' \
-            "${YELLOW}" "${RESET}" "$rem_cron" "$dialectic_cron"
+        printf '  %s[dry-run]%s would set crons = ["%s", "%s", "%s"]\n' \
+            "${YELLOW}" "${RESET}" "$cscc_cron" "$orient_cron" "$dialectic_cron"
         return 0
     fi
-    awk -v rem="$rem_cron" -v dia="$dialectic_cron" '
+    awk -v cscc="$cscc_cron" -v orient="$orient_cron" -v dia="$dialectic_cron" '
         /^crons = / {
-            printf "crons = [\"%s\", \"%s\"]\n", rem, dia
+            printf "crons = [\"%s\", \"%s\", \"%s\"]\n", cscc, orient, dia
             next
         }
         { print }
@@ -251,28 +252,20 @@ if ! command -v openssl >/dev/null 2>&1; then
 fi
 ok "openssl available"
 
-if ! command -v claude >/dev/null 2>&1; then
-    warn "Claude Code not in PATH — you'll need it for Step 5 (long-lived OAuth token)."
-else
-    ok "Claude Code detected"
-fi
-
 # ──── Step 2: Create Cloudflare resources ────────────────────────────
 
 header "[2/8] Creating Cloudflare resources"
 
-# Image storage (R2) — optional. R2 is the only stack component that
-# requires Cloudflare billing to be enabled on the account, even within
-# the 10GB free tier. Free-tier deployers can decline this and still
-# get a fully working memory system; only image features (the rover
-# camera heartbeat, photo memories) need R2.
+# Image storage (R2) — optional. Oneiro already requires the Workers Paid
+# plan (Cloudflare Queues, which the encode pipeline depends on, is
+# Paid-only), so billing is enabled either way. R2 just layers image
+# features on top — decline it and every non-image feature still works.
 say ""
 say "  ${BOLD}Image storage (R2) — optional${RESET}"
 dim "    Image features (remember_with_image, recall_image, rover camera"
-dim "    heartbeats) need a Cloudflare R2 bucket. R2 requires CF billing"
-dim "    enabled on your account, even within its 10GB free tier."
-dim "    Decline if you're on a billing-free CF account — every non-image"
-dim "    feature still works."
+dim "    heartbeats) need a Cloudflare R2 bucket. Oneiro already needs the"
+dim "    Workers Paid plan for Queues, so enabling R2 adds no new billing"
+dim "    requirement. Skip it and every non-image feature still works."
 say ""
 prompt ENABLE_R2 "Enable image storage? [y/N]" "n"
 case "$ENABLE_R2" in
@@ -358,6 +351,39 @@ else
 fi
 ok "KV namespace: ONEIRO_VERSION_CACHE (id: ${VERSION_KV_ID})"
 
+# Queues — the capture pipeline. The encode hook (POST /encode) and the
+# reflect tool enqueue captures here; the consumer writes the episodic
+# and encodes it to semantics. wrangler.toml declares the producer +
+# consumer bindings, but the queues themselves must exist before deploy
+# or `wrangler deploy` fails on the missing queue. Create the DLQ first
+# so the main queue's dead_letter_queue reference resolves.
+#
+# Cloudflare Queues is Workers-Paid-only — there is no free-tier path. If
+# creation fails on a non-Paid account, stop with a clear message rather
+# than letting `wrangler deploy` fail cryptically three steps later.
+say "  Creating queues 'oneiro-capture-dlq' and 'oneiro-capture'..."
+if [ "$DRY_RUN" = true ]; then
+    dim "[dry-run] wrangler queues create oneiro-capture-dlq"
+    dim "[dry-run] wrangler queues create oneiro-capture"
+else
+    for q in oneiro-capture-dlq oneiro-capture; do
+        if Q_OUT=$(wrangler queues create "$q" 2>&1); then
+            printf '%s\n' "$Q_OUT" | tail -2
+        elif printf '%s' "$Q_OUT" | grep -qiE 'already exists|queue_already_exists'; then
+            warn "Queue '$q' already exists; reusing it."
+        else
+            err "Queue create failed for '$q':"
+            printf '%s\n' "$Q_OUT" | sed 's/^/    /'
+            say ""
+            err "Cloudflare Queues requires the Workers Paid plan (\$5/mo)."
+            err "Enable it at dash.cloudflare.com → Workers & Pages → Plans,"
+            err "then re-run ./scripts/setup.sh."
+            exit 1
+        fi
+    done
+fi
+ok "Queues: oneiro-capture (+ DLQ)"
+
 # R2 — only when the operator opted in above. Skipped builds get no
 # IMAGES binding and the worker hides remember_with_image / recall_image
 # from the MCP tools listing at runtime.
@@ -418,9 +444,13 @@ toml_set_after_marker 'binding = "VERSION_CACHE"' 'id' "$VERSION_KV_ID"
 
 header "[3/8] Configuring schedule"
 
-say "  Oneiro runs two cognitive loops on cron triggers:"
-dim "    REM consolidator — clusters and synthesizes memories"
-dim "    Dialectic         — adversarially scrutinises memory calibration"
+say "  Oneiro runs three nightly cognitive loops on cron triggers:"
+dim "    CSCC defrag   — merges near-duplicate semantic memories"
+dim "    Orient distil — distils stable semantics into the orientation layer"
+dim "    Dialectic     — adversarially scrutinises orientation for drift"
+say ""
+say "  CSCC and orient run as a pair at your consolidation time (orient 30"
+say "  minutes after CSCC, so the semantic layer is clean before it distils)."
 say ""
 say "  Common timezones:"
 say "    1) Australia/Brisbane     (AEST, no DST)"
@@ -460,8 +490,8 @@ validate_hhmm() {
 }
 
 while true; do
-    prompt REM_LOCAL "REM run time (HH:MM local, default 00:00)" "00:00"
-    if validate_hhmm "$REM_LOCAL"; then
+    prompt CSCC_LOCAL "Consolidation time (HH:MM local, default 00:00)" "00:00"
+    if validate_hhmm "$CSCC_LOCAL"; then
         break
     fi
     warn "Invalid time. Use HH:MM in 24-hour form, e.g. 00:00 or 18:30."
@@ -475,23 +505,33 @@ while true; do
     warn "Invalid time. Use HH:MM in 24-hour form, e.g. 00:00 or 18:30."
 done
 
-REM_UTC=$(local_to_utc "$TZ_NAME" "$REM_LOCAL")
+CSCC_UTC=$(local_to_utc "$TZ_NAME" "$CSCC_LOCAL")
 DIALECTIC_UTC=$(local_to_utc "$TZ_NAME" "$DIALECTIC_LOCAL")
 
 # Strip leading zeros so cron sees "8" not "08" (cron expressions
 # don't allow zero-padded numbers in some implementations).
 # 10# prefix forces base-10 in bash arithmetic, which is the only
 # place that syntax is understood — printf '%d' doesn't honor it.
-REM_H=$((10#${REM_UTC%:*}))
-REM_M=$((10#${REM_UTC#*:}))
+CSCC_H=$((10#${CSCC_UTC%:*}))
+CSCC_M=$((10#${CSCC_UTC#*:}))
 DIA_H=$((10#${DIALECTIC_UTC%:*}))
 DIA_M=$((10#${DIALECTIC_UTC#*:}))
 
-REM_CRON="${REM_M} ${REM_H} * * *"
+# Orient runs 30 min after CSCC. Compute in minutes-since-midnight and
+# wrap with mod 1440 so a late consolidation time (e.g. 23:45 → 00:15)
+# rolls cleanly into the next UTC day instead of producing hour 24.
+ORIENT_TOTAL=$(( (CSCC_H * 60 + CSCC_M + 30) % 1440 ))
+ORIENT_H=$(( ORIENT_TOTAL / 60 ))
+ORIENT_M=$(( ORIENT_TOTAL % 60 ))
+printf -v ORIENT_UTC '%02d:%02d' "$ORIENT_H" "$ORIENT_M"
+
+CSCC_CRON="${CSCC_M} ${CSCC_H} * * *"
+ORIENT_CRON="${ORIENT_M} ${ORIENT_H} * * *"
 DIALECTIC_CRON="${DIA_M} ${DIA_H} * * *"
 
-toml_set_crons "$REM_CRON" "$DIALECTIC_CRON"
-ok "REM: ${REM_LOCAL} ${TZ_NAME} = ${REM_UTC} UTC (cron: ${REM_CRON})"
+toml_set_crons "$CSCC_CRON" "$ORIENT_CRON" "$DIALECTIC_CRON"
+ok "CSCC:      ${CSCC_LOCAL} ${TZ_NAME} = ${CSCC_UTC} UTC (cron: ${CSCC_CRON})"
+ok "Orient:    ${ORIENT_UTC} UTC (cron: ${ORIENT_CRON}) — 30m after CSCC"
 ok "Dialectic: ${DIALECTIC_LOCAL} ${TZ_NAME} = ${DIALECTIC_UTC} UTC (cron: ${DIALECTIC_CRON})"
 
 NOW_OFFSET=$(TZ="$TZ_NAME" date +%z)
@@ -563,30 +603,31 @@ if [ "$MAKE_API_KEY" = "y" ]; then
     fi
 fi
 
-# ──── Step 5: Claude Code OAuth token ────────────────────────────────
+# ──── Step 5: Anthropic API key ──────────────────────────────────────
 
-header "[5/8] Claude Code long-lived OAuth token"
+header "[5/8] Anthropic API key"
 
 if [ "$DRY_RUN" = true ]; then
-    dim "[dry-run] would prompt for OAuth token (skipping interactive read)"
-    OAUTH_TOKEN="sk-ant-oat01-dryrun-placeholder-token-not-real"
-    ok "Token captured (dry-run synthetic)"
+    dim "[dry-run] would prompt for Anthropic API key (skipping interactive read)"
+    ANTHROPIC_API_KEY="sk-ant-api-dryrun-placeholder-key-not-real"
+    ok "Key captured (dry-run synthetic)"
 else
-    say "  Oneiro's REM consolidator and Dialectic loop call Haiku 4.5 via"
-    say "  the Anthropic API on your Claude subscription credit pool. This"
-    say "  requires a long-lived OAuth token (~1 year) generated by Claude Code."
+    say "  Oneiro's nightly loops (CSCC defrag, orient distil, dialectic)"
+    say "  call Haiku 4.5 and Sonnet 4.6 via the Anthropic Messages API."
+    say "  They bill to a standard Anthropic API key at API rates — a few"
+    say "  dollars a month in normal use."
     say ""
-    say "  In another terminal, run:"
-    say "    ${BOLD}claude setup-token${RESET}"
+    say "  Create a key at:"
+    say "    ${BOLD}https://console.anthropic.com/settings/keys${RESET}"
     say ""
-    say "  Copy the token (starts with ${BOLD}sk-ant-oat01-${RESET}) and paste here."
+    say "  Copy the key (starts with ${BOLD}sk-ant-api${RESET}) and paste here."
 
-    prompt_secret OAUTH_TOKEN "Paste OAuth token"
-    if [ -z "$OAUTH_TOKEN" ] || ! [[ "$OAUTH_TOKEN" == sk-ant-oat01-* ]]; then
-        err "That doesn't look like a Claude Code OAuth token (expected prefix sk-ant-oat01-)."
+    prompt_secret ANTHROPIC_API_KEY "Paste Anthropic API key"
+    if [ -z "$ANTHROPIC_API_KEY" ] || ! [[ "$ANTHROPIC_API_KEY" == sk-ant-api* ]]; then
+        err "That doesn't look like an Anthropic API key (expected prefix sk-ant-api)."
         exit 1
     fi
-    ok "Token captured"
+    ok "Key captured"
 fi
 
 # ──── Step 6: Push secrets ───────────────────────────────────────────
@@ -607,8 +648,12 @@ push_secret "ONEIRO_OAUTH_CLIENT_ID" "$CLIENT_ID"
 ok "ONEIRO_OAUTH_CLIENT_ID"
 push_secret "ONEIRO_OAUTH_CLIENT_SECRET" "$CLIENT_SECRET"
 ok "ONEIRO_OAUTH_CLIENT_SECRET"
-push_secret "CLAUDE_CODE_OAUTH_TOKEN" "$OAUTH_TOKEN"
-ok "CLAUDE_CODE_OAUTH_TOKEN"
+# Secret name is historical (CLA-117 made the auth token-type-aware): the
+# worker reads CLAUDE_CODE_OAUTH_TOKEN and routes sk-ant-api* values to the
+# x-api-key header. We store the Anthropic API key under that name so the
+# runtime contract is unchanged — renaming would touch 8 modules.
+push_secret "CLAUDE_CODE_OAUTH_TOKEN" "$ANTHROPIC_API_KEY"
+ok "CLAUDE_CODE_OAUTH_TOKEN (holds the Anthropic API key)"
 
 if [ -n "$API_KEY_ENTRY" ]; then
     push_secret "ONEIRO_API_KEYS" "$API_KEY_ENTRY"
@@ -716,7 +761,7 @@ ${BOLD}${GREEN}============================================================
 
   ${BOLD}Inspect cognitive activity${RESET}
     ${DIM}wrangler d1 execute oneiro-db --remote --command \\${RESET}
-    ${DIM}  "SELECT * FROM rem_runs ORDER BY started_at DESC LIMIT 5"${RESET}
+    ${DIM}  "SELECT action, keeper_id, decided_at FROM cscc_decisions ORDER BY decided_at DESC LIMIT 5"${RESET}
 
 ${BOLD}${GREEN}============================================================${RESET}
 
