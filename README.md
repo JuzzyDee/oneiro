@@ -58,18 +58,19 @@ Every tier sits on an Ebbinghaus forgetting curve: `strength = e^(-time_since_ac
 
 ### Circadian rhythm
 
-Two scheduled cognitive loops run nightly on Cloudflare Workers via cron triggers — no external infrastructure once `setup.sh` completes.
+Three scheduled cognitive loops run nightly on Cloudflare Workers via cron triggers — no external infrastructure once `setup.sh` completes. All three run under a single shared single-flight lease and are staggered so they never overlap; the defrag cleans the semantic layer before the distiller reads it.
 
 | When | Process | What it does |
 |------|---------|-------------|
-| **00:00 local** | REM / consolidation | Ebbinghaus decay, then cross-semantic consolidation — merge/split, mid-rebuild onto cosine proximity (see Roadmap) — Haiku 4.5 judging each candidate, additive dispatch into D1 + lineage + audit |
-| **18:00 local** | Dialectic | Stage 1 neutral assessor → Stage 2 Advocate vs Challenger dialogue → Stage 3 Synthesizer arbitrates `keep` / `reframe` / `flag`. Catches inflation, overclaiming, validation gravity |
+| **00:00 local** | CSCC defrag | Whole-store cosine-cluster consolidation — Haiku 4.5 judges each near-duplicate cluster and merges it onto a keeper, healing the fragmentation that eager memory-writing accumulates. Lineage + an audit row per decision |
+| **00:30 local** | Orient distil | Distils stable semantics into the always-loaded orientation layer, then whittles it back to a hard cap so the layer stays small and load-bearing — the few things that make the room the room |
+| **18:00 local** | Dialectic | Stage 1 neutral assessor → Stage 2 Advocate vs Challenger dialogue → Stage 3 Synthesizer arbitrates `keep` / `reframe` / `flag`. Aimed at the orientation layer — catches inflation, overclaiming, drift into mythology |
 
 Consolidation is **additive, not destructive** — source episodics are preserved, distilled semantics live alongside them, and a `consolidation_lineage` table tracks parent/child relationships (the MMR rerank above handles the dilution this would otherwise cause at recall time). Every run writes an audit row and one row per decision, so "what did the loops do three weeks ago and why" stays answerable long after Cloudflare's tail buffer ages out.
 
 ### The dialectic
 
-The most novel piece. A scheduled Worker process scrutinises memories for the failure modes that accumulate when an agent writes memories that the same agent later recalls — milestone inflation, overclaim, validation gravity, compression artifact, understatement.
+The most novel piece. A scheduled Worker process scrutinises the always-loaded orientation layer for the failure modes that accumulate when an agent writes memories that the same agent later recalls — milestone inflation, overclaim, validation gravity, compression artifact, understatement. It runs over orientation specifically because that's the layer every instance reads first; drift there propagates everywhere.
 
 Three sequential stages, all on Haiku 4.5:
 
@@ -113,11 +114,17 @@ Stage 3 dispatches through a validation gate. Reframes are atomic — the `memor
 │  KV            OAuth tokens + version-check cache          │
 └────────────────────────────────────────────────────────────┘
 
-  REM / consolidation cron (00:00 local nightly):
-    decay → proximity clustering (merge/split) → Haiku judgment
-    → additive dispatch → D1 + lineage + audit
+  Nightly roster — single shared lease, staggered, single-flight:
 
-  Dialectic cron (18:00 local nightly):
+  CSCC defrag cron (00:00 local):
+    cosine-cluster the whole store → Haiku judges each cluster
+    → merge near-duplicates onto a keeper → D1 + lineage + audit
+
+  Orient distil cron (00:30 local):
+    stable semantics → orientation layer → whittle to the cap
+    → D1 + lineage + audit
+
+  Dialectic cron (18:00 local):
     Stage 1 assessor → Stage 2 Advocate/Challenger
     → Stage 3 Synthesizer arbitration + atomic dispatch
     → D1 + memory_reframes + dialectic_flags + audit
@@ -163,8 +170,7 @@ This is a **deploy-your-own** setup. There's no hosted instance.
 ### Prerequisites
 
 - [Cloudflare account](https://cloudflare.com) on the **Workers Paid plan** (~$5/mo at time of writing) — the encode pipeline runs on [Workers Queues](https://developers.cloudflare.com/queues/), which aren't on the free tier. Everything else (D1, Vectorize, Workers AI, R2, KV, cron) sits comfortably inside paid-plan limits at single-user volume; verify current limits before you rely on them
-- [Claude Pro, Max, Team, or Enterprise subscription](https://claude.com/pricing) — the cognitive loops draw on Haiku 4.5 via your subscription credit pool
-- [Claude Code](https://claude.com/claude-code) — used once to generate the long-lived OAuth token (the script tells you when)
+- [Anthropic API key](https://console.anthropic.com/settings/keys) — the nightly cognitive loops call Haiku 4.5 + Sonnet 4.6 via the Messages API, billed at standard API rates (a few dollars a month in normal single-user use)
 - [`wrangler`](https://developers.cloudflare.com/workers/wrangler/install-and-update/) — `npm install -g wrangler`
 - [`rustup`](https://rustup.rs/) — the setup script adds the `wasm32-unknown-unknown` target on first run
 - `openssl` (preinstalled on macOS and most Linux distros)
@@ -177,9 +183,11 @@ cd oneiro
 ./scripts/setup.sh
 ```
 
-The script walks you through Cloudflare resource creation (D1, Vectorize, R2, KV), credential generation, timezone-aware cron configuration, secret push, schema migration, and worker deploy — usually a few minutes once prerequisites are installed. Run with `--dry-run` first to see what it will do without touching your account.
+The script walks you through Cloudflare resource creation (D1, Vectorize, KV, Queues, and optionally R2), credential generation, timezone-aware cron configuration, secret push, schema migration, and worker deploy — usually a few minutes once prerequisites are installed. Run with `--dry-run` first to see what it will do without touching your account.
 
-It asks for: confirmation you've saved the generated OAuth credentials (shown once); your timezone; local times for the two nightly loops (defaults 00:00 / 18:00); and your long-lived OAuth token from `claude setup-token`. Everything else is automatic.
+It asks for: confirmation you've saved the generated OAuth credentials (shown once); your timezone; a nightly consolidation time and a dialectic time (defaults 00:00 / 18:00); and your Anthropic API key. Everything else is automatic.
+
+**Customising the schedule.** Re-run `./scripts/setup.sh` any time to change when the loops fire — it rewrites both halves of the cron config together (the `[triggers]` block Cloudflare fires on and the `[vars]` block the worker routes on), so they can't drift. Prefer to hand-edit? Set both blocks in `wrangler.toml` to matching values and redeploy.
 
 ### Connect
 
@@ -208,10 +216,10 @@ The skill tells Claude *when* to call `recall_orient`. The hook makes orientatio
 
 ```bash
 wrangler d1 execute oneiro-db --remote \
-  --command "SELECT * FROM rem_runs ORDER BY started_at DESC LIMIT 5"
+  --command "SELECT action, keeper_id, decided_at FROM cscc_decisions ORDER BY decided_at DESC LIMIT 5"
 ```
 
-After the first nightly cron fires, this shows a completed run. The same pattern works for `dialectic_runs`.
+After the first nightly cron fires, this shows the CSCC defrag's merge/keep decisions. The same pattern works for `dialectic_decisions` and `dialectic_runs`.
 
 ## Project Structure
 
@@ -227,8 +235,11 @@ oneiro/
 │   ├── worker_mmr.rs                # MMR rerank — diversity-aware retrieval
 │   ├── worker_encode.rs             # Encode: decompose-first episodic → semantic
 │   ├── worker_encode_batch.rs       # Async batch encode path
-│   ├── worker_rem.rs                # Nightly REM / consolidation (cron)
-│   ├── worker_rem_audit.rs          # REM audit — runs + decisions
+│   ├── worker_cscc.rs               # Nightly cosine-cluster defrag (cron)
+│   ├── worker_adas.rs               # ADAS split detector (read-only)
+│   ├── worker_lease.rs              # Single-flight cognitive-write lease
+│   ├── worker_rem.rs                # Hebbian REM (retired — CSCC replaced it)
+│   ├── worker_rem_audit.rs          # REM audit tables (retired with REM)
 │   ├── worker_dialectic.rs          # Dialectic Stage 1–2 (assessor + dialogue)
 │   ├── worker_dialectic_dispatch.rs # Dialectic Stage 3 dispatcher
 │   ├── worker_dialectic_audit.rs    # Dialectic audit
@@ -239,7 +250,7 @@ oneiro/
 │   ├── worker_auth_ctx.rs           # Auth context + service-key scopes
 │   ├── worker_version.rs            # Update-prompt version check
 │   └── memory.rs                    # Shared types
-├── migrations/                      # D1 schema migrations (0001 → 0014)
+├── migrations/                      # D1 schema migrations (0001 → 0017)
 ├── scripts/
 │   ├── setup.sh                     # One-command first-run deploy
 │   ├── oneiro-orient.sh             # SessionStart/PreCompact orientation hook
@@ -254,15 +265,14 @@ A previous native Rust binary (`main.rs`, `rem.rs`, `store.rs`) ran the whole st
 
 ## Status
 
-**Live, single-tenant.** Oneiro runs in daily use against a single operator's deploy. The Worker handles conversational traffic, the decompose-first encode pipeline, the orientation layer, and the nightly dialectic. No external infrastructure required after `setup.sh`.
+**Live, single-tenant.** Oneiro runs in daily use against a single operator's deploy. The Worker handles conversational traffic, the decompose-first encode pipeline, the orientation layer, and the full nightly roster (CSCC defrag, orient distil, dialectic) — all lease-guarded and self-running. No external infrastructure required after `setup.sh`.
 
-**Mid-rebuild, in the open.** The cross-semantic consolidation pass (the "defrag" — merge + split) is being rebuilt from Hebbian co-activation onto whole-store cosine-proximity clustering; the calibration tooling is in place and the write-bearing pass is next. Encoding over-creates safely in the meantime, by design.
+**The defrag is live.** The cross-semantic consolidation pass (CSCC — whole-store cosine-cluster merge) has replaced the old Hebbian co-activation clustering and now runs nightly on the roster. Encoding deliberately over-creates; CSCC heals the fragmentation on the next pass — over-production is recoverable, under-production is knowledge you never extracted.
 
 **Pre-distribution.** No multi-tenant offering yet — each user deploys their own Worker. A hosted option may follow.
 
 ## Roadmap
 
-- **Consolidation (CSCC)** — finish the whole-store merge/split defrag pass that replaces Hebbian clustering
 - **Tiered model routing** — Haiku for routine passes, escalating to Sonnet/Opus on ambiguity flags
 - **`flagged` MCP tool** — surface Stage 3 `flag` actions as a tool, instead of requiring direct D1 queries
 - **Hosted multi-tenant option** — for users who don't want to run their own Worker

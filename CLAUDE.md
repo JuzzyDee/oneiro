@@ -93,37 +93,41 @@ Flow: Episodes → consolidate → Semantics → distil → Orientation
 ### Memory Dynamics
 
 - **Ebbinghaus decay**: `strength = e^(-time_since_access / stability)`. Each recall resets strength and increases stability.
-- **Hebbian learning**: memories surfaced together strengthen their co-activation count. REM engine consolidates frequently co-activated episodic pairs into semantic memories.
-- **Semantic search**: recall uses embedding similarity (bge-base-en-v1.5 via Workers AI) combined with strength and recency. Associative, not keyword-based.
+- **Cosine-cluster consolidation (CSCC)**: the nightly defrag clusters the whole semantic store by embedding proximity and merges near-duplicates onto a keeper — healing the fragmentation that eager, decompose-first encoding accumulates. This replaced the earlier Hebbian co-activation REM engine.
+- **Hybrid recall**: `recall_orient` fuses embedding similarity (bge-base-en-v1.5 via Workers AI) with D1 FTS5 keyword search (RRF), weights by strength, and reranks with MMR for diversity. Associative, not keyword-based.
 - **Context budget**: recall returns top-K memories ranked by composite score, keeping context manageable.
 
 ### MCP Tools
 
-Six tools, each an act of agency:
+Nine tools, each an act of agency — "you decide," not "you must." (Seven core; the two image tools are R2-backed and hidden from the listing when R2 is absent.)
 
-- `recall` — surface relevant memories. Call at conversation start. Returns orientation (always) + active memories by semantic relevance.
-- `review` — survey the full memory landscape. Returns compact summaries above a strength threshold. For reflection and pattern-finding, not conversation start.
+- `recall_orient` — the entry point. Always returns orientation (grounded from word one) + the most relevant episodic/semantic memories via hybrid retrieval + MMR.
+- `recall_check` — lightweight semantic check on a mid-conversation topic shift.
+- `recall_specific` — fetch full content for a specific memory ID. Deliberate, directed recall.
+- `recall_image` — retrieve an image attached to a memory (thumbnail / recall / full resolution).
 - `remember` — store a new memory. Model decides what's worth keeping.
+- `remember_with_image` — store a memory with an attached image (R2-backed, content-addressed).
 - `reframe` — update an existing memory with new understanding. Memories evolve. Supports ID prefix matching.
 - `forget` — consciously let go of a redundant or superseded memory. Orientation cannot be forgotten. Records tombstones for sync safety.
 - `reflect` — consciously consolidate at natural breakpoints. Not automatic, not on every goodbye. A deliberate choice.
 
 ### Circadian Rhythm
 
-Two scheduled cognitive loops, both running as Cloudflare Worker cron triggers. No external infrastructure required after `setup.sh` completes.
+Three scheduled cognitive loops, all Cloudflare Worker cron triggers under a single shared single-flight lease, staggered so they never overlap. No external infrastructure required after `setup.sh` completes.
 
 | Time | Process | What It Does |
 |------|---------|-------------|
-| **00:00 local** | REM consolidator | Ebbinghaus decay → Hebbian co-activation clustering → Haiku 4.5 judgment per cluster (skip / append / revise / create) → additive dispatch with lineage tracking + audit row |
-| **18:00 local** | Dialectic | Stage 1 neutral assessor → Stage 2 Advocate/Challenger dialogue (up to 2 rounds) → Stage 3 Synthesizer renders verdict and dispatches `keep` / `reframe` / `flag` |
+| **00:00 local** | CSCC defrag | Whole-store cosine-cluster consolidation — Haiku 4.5 judges each near-duplicate cluster (`merge` / `keep_distinct`) and merges onto a keeper. Lineage + a `cscc_decisions` audit row per cluster |
+| **00:30 local** | Orient distil | Distils stable semantics into the always-loaded orientation layer (gated + ranked by the familiarity rubric, rated by Sonnet 4.6), then whittles back to a hard cap. Staggered 30m so it reads CSCC's cleaned layer |
+| **18:00 local** | Dialectic | Over the orientation layer: Stage 1 neutral assessor → Stage 2 Advocate/Challenger dialogue (≤2 rounds) → Stage 3 Synthesizer dispatches `keep` / `reframe` / `flag` |
 
-The dialectic replaces an earlier local "subconscious" pass that ran via Claude Code on an always-on server. The CF rebuild keeps the function (preventing escalation-to-mythology) and changes the mechanism (adversarial dialogue via Haiku, in-Worker, every night).
+REM (the old Hebbian co-activation consolidator) is retired — CSCC replaced it. The dialectic descends from an earlier local "subconscious" pass that ran via Claude Code on an always-on server; the CF rebuild keeps the function (preventing escalation-to-mythology) and changes the mechanism (adversarial dialogue via Haiku, in-Worker, nightly) — now aimed at the orientation layer specifically.
 
 ## Build & Test
 
 ```bash
 cargo build                                    # native build (for tests)
-cargo test                                     # 124 tests pass
+cargo test                                     # full native test suite
 cargo check --target wasm32-unknown-unknown --lib
 worker-build --release                         # CF Worker bundle
 ```
@@ -137,7 +141,7 @@ The native binary path under `src/main.rs` + `src/rem.rs` is preserved for test 
 wrangler deploy                                # subsequent deploys
 ```
 
-`setup.sh` creates the CF resources (D1, Vectorize, R2, KV), generates OAuth credentials, prompts for an Anthropic OAuth token, sets cron times in your timezone, applies migrations, and deploys. One-command setup; everything after is `wrangler deploy` on changes.
+`setup.sh` creates the CF resources (D1, Vectorize, KV, Queues, and optionally R2), generates the OAuth credentials, prompts for an Anthropic API key (`sk-ant-api*`), sets cron times in your timezone, applies migrations, and deploys. One-command setup; everything after is `wrangler deploy` on changes.
 
 ## Project Structure
 
@@ -145,12 +149,16 @@ wrangler deploy                                # subsequent deploys
 src/
 ├── lib.rs                          — Worker entry point + module wiring
 ├── worker_mcp.rs                   — MCP tool handlers (recall, remember, etc.)
-├── worker_store.rs                 — D1 memory store + decay + Hebbian
+├── worker_store.rs                 — D1 memory store + decay + rubric/lineage
 ├── worker_embed.rs                 — Workers AI bge-base-en-v1.5 embeddings
 ├── worker_vectorize.rs             — Vectorize index integration
 ├── worker_oauth.rs                 — OAuth 2.1 authorization code flow
-├── worker_rem.rs                   — REM consolidator (cron)
-├── worker_rem_audit.rs             — REM audit table writes
+├── worker_cscc.rs                  — CSCC nightly cosine-cluster defrag (cron)
+├── worker_adas.rs                  — ADAS split detector (read-only)
+├── worker_orient_distill.rs        — Semantic → orientation distil + whittle (cron)
+├── worker_lease.rs                 — Single-flight cognitive-write lease
+├── worker_rem.rs                   — Hebbian REM (retired — CSCC replaced it)
+├── worker_rem_audit.rs             — REM audit tables (retired with REM)
 ├── worker_dialectic.rs             — Stage 1 assessor + Stage 2 dialogue
 ├── worker_dialectic_audit.rs       — Dialectic audit table writes
 ├── worker_dialectic_dispatch.rs    — Stage 3 dispatcher (reframe/flag/keep)
@@ -169,7 +177,7 @@ oneiro-skill/
 ├── scripts/eval.py                 — Eval test framework
 └── references/                     — Architecture documentation
 
-migrations/                         — D1 schema migrations (0001 → 0006)
+migrations/                         — D1 schema migrations (0001 → 0017)
 VERSION.json                        — Source of truth for update-check pings
 wrangler.toml                       — Account-specific (gitignored)
 wrangler.toml.example               — Template for new installs
@@ -184,7 +192,7 @@ wrangler.toml.example               — Template for new installs
 - **R2** — content-addressed image storage
 - **KV** — OAuth tokens + version-check cache
 - **rmcp 1.4** — MCP server SDK (streamable HTTP transport)
-- **Anthropic OAuth credit pool** — Haiku 4.5 for REM judgments and dialectic personas (long-lived `sk-ant-oat01-*` token via `claude setup-token`)
+- **Anthropic Messages API** — Haiku 4.5 for CSCC + dialectic judgments, Sonnet 4.6 for the orientation familiarity rubric. Auth is token-type-aware (CLA-117): an `sk-ant-api*` key → `x-api-key`, billed at API rates. Stored under the secret name `CLAUDE_CODE_OAUTH_TOKEN` for historical reasons (renaming would touch 8 modules)
 - **argon2 + HMAC-SHA256** — OAuth credential hashing and token signing
 - **Rust 2024 edition** — universal source; wasm32 for Workers, native for tests
 
@@ -192,8 +200,8 @@ wrangler.toml.example               — Template for new installs
 
 Cloudflare Workers does all the heavy lifting. No always-on server required.
 
-- **Worker**: deployed via `wrangler`. Cron triggers fire REM and Dialectic loops.
-- **Anthropic OAuth**: long-lived token from `claude setup-token`. Gated to Haiku 4.5 (Sonnet/Opus 429 on this token type — confirmed empirically). Sufficient for both cognitive loops.
+- **Worker**: deployed via `wrangler`. Cron triggers fire the nightly roster (CSCC, orient distil, dialectic), lease-guarded and staggered.
+- **Anthropic API key**: a standard `sk-ant-api*` key. The loops call Haiku 4.5 (CSCC, dialectic) and Sonnet 4.6 (orientation rubric) via the Messages API, billed at API rates. (The earlier OAuth/`claude setup-token` path was gated to Haiku only — Sonnet/Opus 429'd on that token type; the API key removes that ceiling, which is what lets orient use Sonnet.)
 - **Auth**: OAuth 2.1 authorization code flow with HTML-escaped consent page, CSP headers, exact-match `redirect_uri` allowlist. Optional service API keys with scope gates + audit.
 - **Update prompts**: recall responses include a notice when a newer Oneiro release is available, fetched from `VERSION.json` via GitHub raw with 6h KV cache.
 
@@ -201,10 +209,13 @@ Cloudflare Workers does all the heavy lifting. No always-on server required.
 
 ### Complete
 - [x] Three memory types (episodic, semantic, orientation) with Ebbinghaus decay
-- [x] MCP server with ten tools (recall, recall_check, recall_specific, recall_image, remember, remember_with_image, reframe, forget, reflect, review)
-- [x] Semantic search via Workers AI embeddings + Vectorize + MMR rerank
-- [x] Hebbian co-activation tracking and clustering
-- [x] REM consolidator on Cloudflare (cron, additive dispatch, full audit trail)
+- [x] MCP server with nine tools (recall_orient, recall_check, recall_specific, recall_image, remember, remember_with_image, reframe, forget, reflect)
+- [x] Hybrid retrieval (FTS5 + Vectorize + RRF) with MMR rerank
+- [x] Decompose-first encode pipeline (queue-backed: episodic → units → semantics)
+- [x] CSCC nightly defrag — whole-store cosine-cluster merge (cron, lineage + audit); replaced the Hebbian REM consolidator
+- [x] Orientation distillation + familiarity rubric (2 binary gates, 4 scored dims) + the whittle to a hard cap
+- [x] Single-flight cognitive-write lease + staggered nightly roster (CSCC / orient / dialectic)
+- [x] R2-optional deployment (runtime IMAGES detection)
 - [x] Dialectic Stage 1 — neutral assessor on Cloudflare
 - [x] Dialectic Stage 2 — Advocate/Challenger dialogue + Synthesizer arbitration
 - [x] Dialectic Stage 3 — action dispatcher (reframe/flag/keep) with atomic D1 batches, validation gate, fail-closed dispatch mode
@@ -216,7 +227,6 @@ Cloudflare Workers does all the heavy lifting. No always-on server required.
 - [x] One-time migration helper for the memoria → Oneiro rebrand
 
 ### Next
-- [ ] R2-optional deployment (runtime detection so free-tier deploys work without paid R2)
 - [ ] `flagged` MCP tool — surface Stage 3 flag actions as a tool, not just a D1 query
 - [ ] Hosted multi-tenant option (subscription for users who don't want their own Worker)
 - [ ] Tiered model routing (escalate Haiku → Sonnet on ambiguity flags)
