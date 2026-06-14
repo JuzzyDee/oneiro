@@ -358,9 +358,12 @@ pub async fn set_orient_rubric(
     irreplaceable: Option<i64>,
     cost: Option<i64>,
 ) -> Result<()> {
+    // Clamp to the 0..=3 contract HERE — the single enforcement point for both the
+    // synthesis judge and the backfill. An LLM can emit a stray 7 or -1, and
+    // run_whittle sums these columns blindly to rank the always-loaded set.
     let n = |o: Option<i64>| -> worker::wasm_bindgen::JsValue {
         match o {
-            Some(v) => (v as i32).into(),
+            Some(v) => (v.clamp(0, 3) as i32).into(),
             None => worker::wasm_bindgen::JsValue::NULL,
         }
     };

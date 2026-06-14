@@ -107,7 +107,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // Admin: cscc-execute (CLA-134). Clusters + judges like calibrate, then
         // folds each confirmed MERGE into its keeper. `?commit=false` (default) is
         // a DRY RUN — no writes, shows the fold plan; `commit=true` writes.
-        (Method::Get, "/admin/cscc-execute") => admin_cscc_execute_endpoint(&env, &req).await,
+        (Method::Post, "/admin/cscc-execute") => admin_cscc_execute_endpoint(&env, &req).await,
 
         // Admin: split-preview (CLA-134, ADAS). READ-ONLY conflation detector —
         // ranks live semantics by over-creation (orientation axes fed) + length,
@@ -902,7 +902,9 @@ async fn admin_split_preview_endpoint(env: &Env, req: &Request) -> Result<Respon
     }
 }
 
-/// GET /admin/cscc-execute?threshold=0.90&min_size=2&commit=false — CSCC merge
+/// POST /admin/cscc-execute?threshold=0.90&min_size=2&commit=false — CSCC merge
+/// (POST, not GET: mutates the store when commit=true, so it must not be triggerable
+/// by URL-following / prefetch / intermediary GET retries.)
 /// executor (CLA-134). Clusters + judges like cscc-calibrate, then for each MERGE
 /// verdict folds the non-keeper members into the keeper (repoint lineage edges,
 /// supersede the folded). `commit=false` (default) is a DRY RUN — no writes, just

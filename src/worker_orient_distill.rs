@@ -247,16 +247,30 @@ pub async fn distill_one(
     let orient_ids: std::collections::HashSet<&str> =
         current_orientation.iter().map(|m| m.id.as_str()).collect();
 
-    // Core-revise-lock evidence: the human-pinned bedrock axes. A failed fetch
-    // leaves this empty (fail-open for one run, the prompt cardinal rule still in
-    // force) — logged, never silent.
-    let core_ids = worker_store::core_orientation_ids(db).await.unwrap_or_else(|e| {
-        worker::console_log!(
-            "orient: core-id fetch failed ({:?}); core-revise-lock inactive this run",
-            e
-        );
-        std::collections::HashSet::new()
-    });
+    // Core-revise-lock evidence: the human-pinned bedrock axes. FAIL CLOSED — if we
+    // can't load the core set we can't protect it, so abort this driver rather than
+    // proceed with the lock disabled. An empty set would let a revise/supersede land
+    // on a core — the exact write this lock exists to prevent.
+    let core_ids = match worker_store::core_orientation_ids(db).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            worker::console_log!(
+                "orient: core-id fetch failed ({:?}); aborting distill to keep the core-revise-lock fail-closed",
+                e
+            );
+            return Ok(OrientOutcome {
+                semantic_id: driver.id.clone(),
+                decisions: vec![OrientDecisionOutcome {
+                    action: "skip-core-fetch-failed".to_string(),
+                    orientation_id: None,
+                    flavour: None,
+                    rationale: Some(
+                        "core-id fetch failed — aborted to protect bedrock axes".to_string(),
+                    ),
+                }],
+            });
+        }
+    };
 
     let mut decisions = orient_via_claude(env, driver, &cluster, current_orientation).await?;
     let mut outcomes = Vec::new();
@@ -944,7 +958,18 @@ pub async fn run_whittle(db: &D1Database) -> Result<Vec<WhittleRanking>> {
 
     // Best-first. Cores are pinned regardless of score; the sort only orders the
     // display and the non-core cut below.
-    ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    // Score desc, then a DETERMINISTIC tiebreak — the rubric sum is only 0–12 and
+    // saturates at 12, so ties are common, and orientation_ranking_rows has no
+    // ORDER BY; without a stable secondary key, equal-score axes inherit arbitrary
+    // D1 row order and flap active/dormant between runs. Higher standing-meaning
+    // wins the tie; id breaks any remainder so the cut is reproducible.
+    ranked.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.meaning.unwrap_or(0).cmp(&a.meaning.unwrap_or(0)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     // Active set = every core + the top non-cores up to ORIENT_CAP total, so the
     // loaded set stays ~ORIENT_CAP with the precious pins always in.

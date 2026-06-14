@@ -185,6 +185,10 @@ pub async fn split_judge_preview(
     min_len: i64,
     limit: usize,
 ) -> Result<Value> {
+    // One model call per candidate below — cap so an oversized limit can't spike
+    // worker runtime / external API cost. Admin-triggered, but this guards a fat-finger.
+    const ADAS_MAX_CANDIDATES: usize = 50;
+    let limit = limit.min(ADAS_MAX_CANDIDATES);
     #[derive(Deserialize)]
     struct Cand {
         id: String,

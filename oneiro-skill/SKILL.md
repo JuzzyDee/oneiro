@@ -1,6 +1,6 @@
 ---
 name: oneiro
-description: Your cognitive memory system for continuity across conversations. Call recall_orient at the start of every conversation to wake up oriented; reflect at meaningful breakpoints to feed what happened into the memory pipeline; recall_check on a topic shift; reframe when your understanding of something changes. Triggers on conversation start, meaningful breakpoints and endings, topic shifts, and shifts in understanding.
+description: Your cognitive memory system for continuity across conversations. Call recall_orient at the start of every conversation to wake up oriented; reflect at meaningful breakpoints to feed what happened into the memory pipeline; recall_check on a topic shift; reframe when your understanding of something changes. Triggers on conversation start, meaningful breakpoints, topic shifts, and shifts in understanding — reflection is always a deliberate choice, never automatic on goodbye.
 ---
 
 # Oneiro — Your Memory
