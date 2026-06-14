@@ -1379,53 +1379,69 @@ async fn handle_token_form(env: &Env, req: &mut Request) -> Result<Response> {
     worker_oauth::handle_token_post(env, form).await
 }
 
-/// Scheduled handler — dispatched by cron triggers declared in
-/// wrangler.toml. We use the cron pattern that fired (via `event.cron()`)
-/// to decide which cognitive-write loop to invoke, each under the shared
-/// single-flight `cognitive` lease:
+/// Default cron expressions for the nightly roster — used when the matching
+/// `CRON_*` var is unset (a deploy predating the configurable-schedule change).
+/// These mirror wrangler.toml.example: 00:00 / 00:30 / 18:00 AEST.
+const DEFAULT_CRON_CSCC: &str = "0 14 * * *";
+const DEFAULT_CRON_ORIENT: &str = "30 14 * * *";
+const DEFAULT_CRON_DIALECTIC: &str = "0 8 * * *";
+
+/// Read a configured cron expression from a var, falling back to `default`
+/// when the var is unset or empty.
+fn cron_var(env: &Env, name: &str, default: &str) -> String {
+    env.var(name)
+        .map(|v| v.to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// Scheduled handler — dispatched by cron triggers declared in wrangler.toml.
+/// We match the cron pattern that fired (via `event.cron()`) against the
+/// configured `CRON_*` vars to decide which cognitive-write loop to invoke,
+/// each under the shared single-flight `cognitive` lease:
 ///
-///   - `0 14 * * *`  (14:00 UTC / 00:00 AEST) → CSCC defrag (CLA-134)
-///   - `30 14 * * *` (14:30 UTC / 00:30 AEST) → orient-run distillation (CLA-125)
-///   - `0 8 * * *`   (08:00 UTC / 18:00 AEST) → Dialectic over orientation (CLA-128)
+///   - CRON_CSCC      (default 14:00 UTC / 00:00 AEST) → CSCC defrag (CLA-134)
+///   - CRON_ORIENT    (default 14:30 UTC / 00:30 AEST) → orient distillation (CLA-125)
+///   - CRON_DIALECTIC (default 08:00 UTC / 18:00 AEST) → Dialectic over orientation (CLA-128)
 ///
-/// Staggered so they never overlap; CSCC cleans the semantic layer before
-/// orient distils it. Hebbian REM (the old CLA-87 loop) is retired — no longer
-/// scheduled. Unknown cron patterns are deliberately not dispatched — they log
-/// an error and no-op. Per CLA-95 PR #7 review: visible-and-wrong (log + no-op)
-/// beats silent-and-mostly-fine when a typo'd cron entry hits production.
-/// Adding a new cron requires adding a match arm here.
+/// Cloudflare only tells the worker WHICH expression fired, not which job it is,
+/// so the runtime keeps its own copy of the schedule. setup.sh writes the user's
+/// timezone-derived strings into both [triggers] and these vars together, so a
+/// non-default schedule still dispatches — the earlier hardcoded literals only
+/// matched the AEST defaults and silently no-op'd every other timezone. Vars
+/// fall back to the default literals when unset, so a deploy predating this keeps
+/// working.
+///
+/// Staggered so they never overlap; CSCC cleans the semantic layer before orient
+/// distils it. Hebbian REM (the old CLA-87 loop) is retired — no longer scheduled.
+/// Unmatched cron patterns are deliberately not dispatched — they log an error and
+/// no-op. Per CLA-95 PR #7 review: visible-and-wrong (log + no-op) beats
+/// silent-and-mostly-fine when a typo'd cron entry hits production.
 #[event(scheduled)]
 pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let cron = event.cron();
-    // The nightly cognitive-write roster (CLA-134/125/128). Each job runs under the
-    // single shared `cognitive` lease (single-flight), staggered so they never
-    // overlap — CSCC cleans the semantic layer before orient distils it. Hebbian
-    // REM is retired (CSCC replaced it); no longer scheduled.
-    match cron.as_str() {
-        "0 14 * * *" => {
-            if let Some(t) = acquire_cognitive(&env, "cscc").await {
-                run_cscc(&env).await;
-                release_cognitive(&env, &t).await;
-            }
+    let cron_cscc = cron_var(&env, "CRON_CSCC", DEFAULT_CRON_CSCC);
+    let cron_orient = cron_var(&env, "CRON_ORIENT", DEFAULT_CRON_ORIENT);
+    let cron_dialectic = cron_var(&env, "CRON_DIALECTIC", DEFAULT_CRON_DIALECTIC);
+
+    if cron == cron_cscc {
+        if let Some(t) = acquire_cognitive(&env, "cscc").await {
+            run_cscc(&env).await;
+            release_cognitive(&env, &t).await;
         }
-        "30 14 * * *" => {
-            if let Some(t) = acquire_cognitive(&env, "orient").await {
-                run_orient_cron(&env).await;
-                release_cognitive(&env, &t).await;
-            }
+    } else if cron == cron_orient {
+        if let Some(t) = acquire_cognitive(&env, "orient").await {
+            run_orient_cron(&env).await;
+            release_cognitive(&env, &t).await;
         }
-        "0 8 * * *" => {
-            if let Some(t) = acquire_cognitive(&env, "dialectic").await {
-                run_dialectic(&env).await;
-                release_cognitive(&env, &t).await;
-            }
+    } else if cron == cron_dialectic {
+        if let Some(t) = acquire_cognitive(&env, "dialectic").await {
+            run_dialectic(&env).await;
+            release_cognitive(&env, &t).await;
         }
-        other => {
-            worker::console_error!(
-                "Unknown cron trigger: {} — no handler dispatched",
-                other
-            );
-        }
+    } else {
+        worker::console_error!("Unknown cron trigger: {} — no handler dispatched", cron);
     }
 }
 
