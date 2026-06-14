@@ -150,21 +150,21 @@ fn handle_tools_list(env: &Env) -> Value {
                 "name": "recall_orient",
                 "description": "Conversation-start orientation. Returns all orientation \
                                 memories (always-loaded identity context, pinned at strength \
-                                1.0) plus the N most recently created episodic memories \
-                                (chronological-recent, default N=3). No semantic search, no \
-                                embedding, no guessing at conversation start. Call this \
-                                first — the orientation is who you are with this user and \
-                                the recents are what's been happening lately. If a specific \
-                                topic later needs surfacing, use recall_check.",
+                                1.0) plus the distilled knowledge from the most recent capture \
+                                — summaries of the atomic semantics it decomposed into, up to \
+                                N (default 15). No semantic search, no embedding, no guessing \
+                                at conversation start. Call this first — the orientation is \
+                                who you are with this user and the recents are what's been \
+                                happening lately. If a specific topic later needs surfacing, \
+                                use recall_check.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "n": {
                             "type": "integer",
-                            "description": "Number of most-recent episodic memories to \
-                                            include (default 3, max 50). Pass 0 for \
-                                            orientation only. Values above the max are \
-                                            clamped server-side."
+                            "description": "Number of recent semantic summaries to include \
+                                            (default 15, also the max). Pass 0 for orientation \
+                                            only. Values above the max are clamped server-side."
                         }
                     }
                 }
@@ -233,8 +233,8 @@ fn handle_tools_list(env: &Env) -> Value {
                         },
                         "memory_type": {
                             "type": "string",
-                            "enum": ["episodic", "semantic", "orientation"],
-                            "description": "Filter to memories of this type."
+                            "enum": ["semantic", "orientation"],
+                            "description": "Filter to memories of this type. Episodics are never returned — they're pipeline input, not recall material."
                         },
                         "tags": {
                             "type": "array",
@@ -249,7 +249,9 @@ fn handle_tools_list(env: &Env) -> Value {
             {
                 "name": "recall_specific",
                 "description": "Retrieve specific memories by id list — the deliberate choice \
-                                to think about something. Returns full content (not summaries). \
+                                to think about something. Returns full content for semantic and \
+                                orientation memories; episodics are not surfaced (pipeline input — \
+                                find their distilled semantics via recall_check). \
                                 Strongest co-activation signal (the conscious choice to surface \
                                 these together shapes future recall).",
                 "inputSchema": {
@@ -385,6 +387,19 @@ fn handle_tools_list(env: &Env) -> Value {
         }
     }
 
+    // Delist the direct-write tools from the MCP surface (tool recalibration):
+    // `reflect` is the pipeline write path; `remember` / `remember_with_image`
+    // bypass decompose + search + link and are an anti-pattern under V2. Their
+    // definitions and handlers stay in source (infra intact) — just unadvertised.
+    // Re-enable by removing this retain. (remember_with_image waits on the rover
+    // image story; remember is superseded by reflect.)
+    if let Some(arr) = listing.get_mut("tools").and_then(Value::as_array_mut) {
+        arr.retain(|t| {
+            let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+            name != "remember" && name != "remember_with_image"
+        });
+    }
+
     listing
 }
 
@@ -482,20 +497,20 @@ struct RecallOrientArgs {
     n: Option<usize>,
 }
 
-/// Maximum number of recent episodics `recall_orient` will return,
-/// regardless of caller request. Bounds payload size + D1 read cost —
-/// the entry-point tool should be fast and small. Anything beyond this
-/// is a "browse the store" job and belongs in `review`-style tooling.
-const MAX_RECALL_ORIENT_N: usize = 50;
+/// Cap on recent semantic summaries `recall_orient` surfaces, regardless of
+/// caller request. The recents are the distilled units of the last capture (the
+/// `cv_latest_semantic` view); a large session decomposes into many, so the cap
+/// — applied over the weight-ordered view — keeps the entry-point payload small
+/// and fast. Browsing the full store is a `review`-style job.
+const MAX_RECALL_ORIENT_N: usize = 15;
 
-/// recall_orient — the conversation-start tool (CLA-103). Returns all
-/// orientation memories plus N most recent episodics (default N=3,
-/// clamped to MAX_RECALL_ORIENT_N). No embed, no Vectorize, no MMR.
-/// The work that makes this payload good already happened upstream
-/// during reflect/dialectic passes; here we just surface it.
-/// Conscious-call semantics: touches surfaced memories (Hebbian
-/// reinforcement) and co-activates the recents (they were surfaced
-/// together).
+/// recall_orient — the conversation-start tool (CLA-103 / V2). Returns all
+/// orientation memories plus the distilled delta of the most recent capture —
+/// summaries of the semantics it decomposed into, capped at MAX_RECALL_ORIENT_N.
+/// No embed, no Vectorize, no MMR. The work that makes the payload good already
+/// happened upstream (encode/distil); here we just surface it. Conscious-call
+/// semantics: touches surfaced memories (reinforcement) and co-activates the
+/// recents (they were surfaced together).
 async fn tool_recall_orient(
     env: &Env,
     db: &D1Database,
@@ -503,7 +518,7 @@ async fn tool_recall_orient(
 ) -> std::result::Result<String, String> {
     let args: RecallOrientArgs = serde_json::from_value(args)
         .map_err(|e| format!("invalid recall_orient args: {}", e))?;
-    let n = args.n.unwrap_or(3).min(MAX_RECALL_ORIENT_N);
+    let n = args.n.unwrap_or(MAX_RECALL_ORIENT_N).min(MAX_RECALL_ORIENT_N);
 
     let orientation = worker_store::get_active_orientation(db)
         .await
@@ -511,9 +526,9 @@ async fn tool_recall_orient(
     let recent = if n == 0 {
         Vec::new()
     } else {
-        worker_store::get_recent_episodics(db, n)
+        worker_store::get_latest_semantic_brief(db, n)
             .await
-            .map_err(|e| format!("get_recent_episodics: {:?}", e))?
+            .map_err(|e| format!("get_latest_semantic_brief: {:?}", e))?
     };
     let counts = worker_store::count_by_type(db).await.unwrap_or((0, 0, 0));
 
@@ -796,6 +811,14 @@ async fn tool_recall_check(
             )
         })?),
     };
+    // Episodics are pipeline INPUT, never recall material — and their content
+    // (and often their summaries) are 10–25k context-killers. recall_check
+    // surfaces semantics + orientation only; refuse an episodic filter outright
+    // rather than silently returning nothing.
+    if matches!(memory_type_filter, Some(MemoryType::Episodic)) {
+        return Err("episodics aren't recallable — they're pipeline input, not surfacing material. Drop the memory_type filter or use memory_type=semantic to search their distilled knowledge.".to_string());
+    }
+
     let entity_filter = args.entity.as_deref();
     let filters_active =
         entity_filter.is_some() || memory_type_filter.is_some() || !args.tags.is_empty();
@@ -917,24 +940,29 @@ async fn tool_recall_check(
     };
 
     // ── CLA-108 metadata filters + MMR rerank ─────────────────────
-    let (reranked_ids, memories): (Vec<String>, Vec<Memory>) = if filters_active {
+    let (reranked_ids, memories): (Vec<String>, Vec<Memory>) = {
         let candidate_ids: Vec<&str> = pool.iter().map(|m| m.id.as_str()).collect();
         let candidates = worker_store::get_many(db, &candidate_ids)
             .await
             .map_err(|e| format!("get_many: {:?}", e))?;
         let candidate_lookup: std::collections::HashMap<&str, &Memory> =
             candidates.iter().map(|m| (m.id.as_str(), m)).collect();
+        // Exclude episodics ALWAYS (pipeline input, not surfacing material; 10–25k
+        // context-killers), then apply any CLA-108 metadata filters on top. We
+        // always hydrate the pool now, because the type test only D1 carries — the
+        // cost is one get_many over ~limit*3 ids, which the old `else` path paid anyway.
         let filtered_matches: Vec<worker_vectorize::VectorMatchWithVector> = pool
             .into_iter()
             .filter(|vm| {
-                candidate_lookup
-                    .get(vm.id.as_str())
-                    .is_some_and(|m| m.matches_filter(entity_filter, memory_type_filter, &args.tags))
+                candidate_lookup.get(vm.id.as_str()).is_some_and(|m| {
+                    !matches!(m.memory_type, MemoryType::Episodic)
+                        && m.matches_filter(entity_filter, memory_type_filter, &args.tags)
+                })
             })
             .collect();
         if filtered_matches.is_empty() {
             return Ok(format!(
-                "No memories matched filters for topic: \"{}\" (threshold: {:.2})",
+                "No (non-episodic) memories matched for topic: \"{}\" (threshold: {:.2})",
                 args.topic, min_similarity
             ));
         }
@@ -944,13 +972,6 @@ async fn tool_recall_check(
             .filter_map(|id| candidates.iter().find(|m| &m.id == id).cloned())
             .collect();
         (reranked, kept)
-    } else {
-        let reranked = crate::worker_mmr::mmr_rerank(&query_emb, &pool, limit, 0.7);
-        let ids: Vec<&str> = reranked.iter().map(String::as_str).collect();
-        let mems = worker_store::get_many(db, &ids)
-            .await
-            .map_err(|e| format!("get_many: {:?}", e))?;
-        (reranked, mems)
     };
 
     // Touch + co-activate — recall_check is still reinforcement.
@@ -1040,6 +1061,16 @@ async fn tool_recall_specific(
 
     let mut out = String::from("═══ Specific recall ═══\n\n");
     for m in &memories {
+        // Episodics are pipeline input, not surfacing material — and their full
+        // content is a 10–25k context-killer. Surface a pointer, not the blob; the
+        // distilled knowledge lives in the semantics (find them via recall_check).
+        if matches!(m.memory_type, MemoryType::Episodic) {
+            out.push_str(&format!(
+                "[{} | episodic] not surfaced — episodic content is pipeline input. Use recall_check to find its distilled semantics.\n\n",
+                &m.id[..8]
+            ));
+            continue;
+        }
         out.push_str(&format_memory(m));
         out.push('\n');
     }
