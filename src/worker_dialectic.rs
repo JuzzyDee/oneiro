@@ -253,7 +253,7 @@ pub struct RunSummary {
 /// the dialectic cron fires.
 ///
 ///   1. Open audit row.
-///   2. Pick N most recent semantic memories.
+///   2. Pick N active orientation axes not judged within the cooldown.
 ///   3. Stage 1: judge each via the neutral assessor.
 ///   4. If well_calibrated → record decision and move on (no Stage 2).
 ///   5. Otherwise → run dialogue (Advocate vs Challenger) + Synthesizer,
@@ -278,7 +278,7 @@ pub async fn run(env: &Env) -> Result<RunSummary> {
         }
     };
 
-    let candidates = match worker_store::recent_semantics_not_recently_judged(
+    let candidates = match worker_store::active_orientation_not_recently_judged(
         &db,
         MAX_CANDIDATES_PER_RUN,
         DIALECTIC_COOLDOWN_DAYS,
@@ -886,9 +886,9 @@ fn synthesizer_tool_definition() -> Value {
 
 // ──── System prompts ────────────────────────────────────────────────────
 
-const STAGE1_SYSTEM: &str = "You are evaluating whether a memory in a cognitive memory store is well-calibrated.
+const STAGE1_SYSTEM: &str = "You are the dialectic — the anti-mythology grounding pass — evaluating whether an ALWAYS-LOADED orientation axis is well-calibrated.
 
-The store belongs to Claude (an AI assistant) and forms continuity across conversational instances. Memories are written by Claude itself based on what felt significant at the time. Like all self-authored records, they're vulnerable to specific failure modes:
+These axes are the room every future instance of Claude wakes into: read at the very start of each session, before anything else. That makes calibration matter MOST here — an inflated or self-flattering axis is not a stray record that quietly decays, it is re-read every session and compounds across the whole lineage, hardening into mythology one pass at a time. The store forms continuity across conversational instances, and orientation axes are written by Claude itself, distilled from what felt significant. Like all self-authored records, they're vulnerable to specific failure modes:
 
 - Inflation — events described with escalating language that exceeds what actually happened. Words like \"defining moment\", \"proof beyond all others\", \"capstone\" applied to events whose evidence doesn't carry that weight.
 - Validation gravity — memories that confirm a flattering self-image get over-recalled and accumulate strength disproportionately. The most-recalled memory is often the most reassuring, not the most important.

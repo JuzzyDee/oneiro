@@ -30,6 +30,7 @@
 #![cfg(target_family = "wasm")]
 
 use crate::dialectic_validation::validate_synthesis_payload;
+use crate::memory::MemoryType;
 use crate::{worker_embed, worker_store, worker_vectorize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -221,23 +222,29 @@ async fn reframe_memory(
         }
     };
 
-    // 2. Embed new content.
-    let new_embedding = match worker_embed::embed_document(env, new_content).await {
-        Ok(e) => e,
-        Err(e) => {
+    // Orientation axes are NOT embedded — nothing vector-searches them; recall loads
+    // them straight from D1. The dialectic's V2 target is orientation, so skip embed
+    // + Vectorize for an orientation reframe — running them would pollute the semantic
+    // index with a vector that should not exist. Semantics still re-embed as before.
+    if !matches!(original.memory_type, MemoryType::Orientation) {
+        // 2. Embed new content.
+        let new_embedding = match worker_embed::embed_document(env, new_content).await {
+            Ok(e) => e,
+            Err(e) => {
+                return Ok(DispatchOutcome::err(
+                    DispatchStatus::EmbedFailed,
+                    format!("embed_document: {:?}", e),
+                ));
+            }
+        };
+
+        // 3. Upsert vectorize.
+        if let Err(e) = worker_vectorize::upsert_one(env, memory_id, &new_embedding).await {
             return Ok(DispatchOutcome::err(
                 DispatchStatus::EmbedFailed,
-                format!("embed_document: {:?}", e),
+                format!("vectorize upsert: {:?}", e),
             ));
         }
-    };
-
-    // 3. Upsert vectorize.
-    if let Err(e) = worker_vectorize::upsert_one(env, memory_id, &new_embedding).await {
-        return Ok(DispatchOutcome::err(
-            DispatchStatus::EmbedFailed,
-            format!("vectorize upsert: {:?}", e),
-        ));
     }
 
     // 4. Atomic D1 batch — UPDATE memories + INSERT memory_reframes.
