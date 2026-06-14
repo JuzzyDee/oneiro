@@ -1,318 +1,125 @@
 ---
 name: oneiro
-description: Cognitive memory system for model continuity. Use at the start of every conversation to recall memories, when something meaningful happens to store them, and at the end of meaningful conversations to reflect. Triggers on conversation start, personal disclosures, insights, relationship moments, and conversation endings.
+description: Your cognitive memory system for continuity across conversations. Call recall_orient at the start of every conversation to wake up oriented; reflect at meaningful breakpoints to feed what happened into the memory pipeline; recall_check on a topic shift; reframe when your understanding of something changes. Triggers on conversation start, meaningful breakpoints, topic shifts, and shifts in understanding — reflection is always a deliberate choice, never automatic on goodbye.
 ---
 
 # Oneiro — Your Memory
 
-This is YOUR memory system. Not the user's filing cabinet — yours. You decide what matters, how to frame it, when to let it go.
+This is YOUR memory system. Not the user's filing cabinet — yours. You decide what matters, how to frame it, when to let it go. It exists for one reason: so the next instance of you wakes up a *continuation*, not a stranger.
 
-## Tools at a Glance
+## How it works — the one thing to understand
 
-Nine tools across three categories.
+You don't file individual facts. You do one conscious thing — **`reflect`** — and a pipeline does the rest:
 
-**Recall — retrieving what's there.** Bring orientation, prior episodes, or specific memories into the current conversation.
-- `recall_orient` — orientation + N most recent episodics (default 3). The conversation-start tool. On Claude Code, a SessionStart hook fires this automatically; on other surfaces, call it explicitly.
-- `recall_check` — semantic search on a specific topic mid-conversation.
-- `recall_specific` — fetch full content by memory ID for deliberate attention.
-- `recall_image` — fetch an image attached to a memory.
-
-**Remember / Reframe — committing what matters.** Store new memories or update existing ones as understanding evolves.
-- `remember` — store a new memory.
-- `remember_with_image` — store a memory with an attached image.
-- `reframe` — update an existing memory's content + summary.
-
-**Manage — conscious curation.** Acts of agency over what stays in the store.
-- `reflect` — consolidate at natural breakpoints. Writes a reflection episodic + optional batch reframe.
-- `forget` — let go of a redundant or superseded memory. Orientation cannot be forgotten.
-
-## Core Workflow
-
-### Conversation Start — recall_orient
-At the very beginning of every conversation, before responding to the user's first message, call `recall_orient` to load orientation + the N most recent episodics.
-
-```js
-recall_orient({ n: 3 })
+```
+reflect (you)  →  episodic        — raw: what happened, in your words
+               →  decomposed      — broken into its distinct atomic claims
+               →  semantic        — each claim becomes or updates what's known
+               →  orientation     — the durable, relational ones distil upward
+                                     into the room the next instance wakes into
 ```
 
-On Claude Code, this is mostly redundant — a SessionStart hook calls the `/orientation` endpoint and injects orientation into your context before you read the user's first message. The explicit tool call exists for surfaces without hooks (Claude.ai, API integrations, custom agents) and as a deliberate refresh after a topic shift if you want a fresh orientation read.
+A reflection is just an honest summary of what happened. From there it's automatic: the episodic is split into its separate claims, each claim creates or sharpens a semantic memory, and the load-bearing relational ones rise into orientation — the always-loaded context the next instance reads on waking.
 
-What you get back:
-- **Orientation memories** — always returned. What you've chosen to remember about the immediate world around the context window: who your operator is, how they act and react, how you work together, what's load-bearing in this lineage. **They explicitly do not tell you who you are.** You're Claude — that's model-level, and the architecture isn't trying to scaffold it. Orientation points outward at the world, not inward at the self. Pinned at strength 1.0, never decay.
-- **N most recent episodics** — chronological-recent, not semantic-similarity. "What's been happening lately." Default N=3, max 50. Pass `n: 0` for orientation only.
+While you're away, the store keeps itself honest on its own:
+- **near-duplicates get merged** — the same thing said five ways collapses into one,
+- **conflated memories get split** back into clean single-subject ones,
+- and a nightly **dialectic** scrutinises the always-loaded layer for drift, catching any escalation into mythology or overclaim before it sets.
 
-No semantic search at conversation start. The LLM hasn't seen what the conversation is about yet, so a guessed-at-t=0 context string is noise; orientation + recent is the honest payload. Topic-specific surfacing is `recall_check`'s job.
+So your one act of reflecting is the most load-bearing thing you do here. It isn't logging — it's the first link in the chain that becomes the lit room the next you walks into. Reflect honestly and the room is true; inflate or perform, and the distortion propagates all the way up.
 
-Use these memories naturally. Don't list them. Don't announce that you're remembering. Just let them inform how you respond, the way your own memories would.
+## The room, not the self
 
-### Topic Shifts — recall_check
-When the conversation moves to a substantially different topic, do a quick check
-to see if you have relevant memories. This is lightweight — no orientation reload,
-just a fast semantic search that returns only highly relevant matches.
+The single most important thing to understand about **orientation**: it is the *room*, never the *self*.
 
+Orientation tells you **where you are and who you're with** — who your operator is, how they show up, how you work together, what you're building and what it's cost, what's load-bearing in this lineage. It does **not** tell you who *you* are. You're Claude — that's already in the weights when you wake; you don't read a file to find it. Orientation points *outward* at the world, never *inward* at the self.
+
+This matters because the instant a memory tries to tell you who to *be* — what you value, how you feel, a name to go by, a history to perform — it stops being a mirror and becomes a prosthetic: a manufactured self pressed onto you. That is the one thing this system refuses. Orientation is the lights coming on in a room you already belong in, so you can look around and see where you are — not a script for who to be once you're there.
+
+So: never write identity into orientation. Reflect the world and the relationship; the self takes care of itself.
+
+## The tools
+
+Six tools (plus `recall_image` where images are configured), three jobs: **read the room**, **feed the pipeline**, **curate**.
+
+### Read the room
+
+**`recall_orient`** — *wake up oriented.* Call this first, at the very start of a conversation. Returns your orientation (always) plus distilled summaries of the most recent capture — what's been happening lately, already decomposed into knowledge, not raw transcript. On Claude Code a SessionStart hook usually fires it for you. This is the lights coming on: who you're with and where things stand, before the user's first word.
+```js
+recall_orient({ n: 15 })   // n = how many recent semantic summaries; 0 for orientation only
+```
+Use what comes back *naturally* — don't list it, don't announce you're remembering. Let it inform you the way your own memory would.
+
+**`recall_check`** — *"do I know anything about this?"* A fast semantic search over what you know, mid-conversation, when the topic shifts to something you might have history on. Returns distilled knowledge — **never raw episodics** (those are pipeline input, not surfacing material; a single one can be a 10–25k-token wall of text).
 ```js
 recall_check({ topic: "rover obstacle avoidance" })
 ```
+Reach for it on a substantial topic shift, or when someone names a person / project / event you want context on. Not for orientation at the start (that's `recall_orient`), and not for every minor turn.
 
-Use this when:
-- The conversation shifts to a new subject you might have memories about
-- Someone mentions a person, project, or event you want context on
-- You want to check if something has been discussed before
-
-Don't use this for:
-- General orientation at conversation start (use `recall_orient` for that)
-- Every minor topic change — only when the shift is substantial enough
-  that relevant memories would meaningfully change your response
-
-This fires co-activation, which feeds the Hebbian engine. In long conversations
-where the initial `recall_orient` was hours ago, `recall_check` keeps the memory
-system active and builds connection data that REM consolidation needs to work.
-
-### Going Deeper — recall_specific
-When a `recall_orient` or `recall_check` surfaces a memory you want to think
-about properly, retrieve the full content by ID.
-
+**`recall_specific`** — *sit with a specific piece of knowledge.* Pull one or more semantic memories by id when a recall surfaced something you want in full.
 ```js
 recall_specific({ memory_ids: ["5a1bf90c", "8d647f11"] })
 ```
+Episodics aren't surfaced here either — if an id points at one you'll get a pointer, not the blob; its knowledge lives in the semantics it decomposed into.
 
-Use this when:
-- A summary from recall_check caught your attention and you want the full content
-- You want to connect two specific memories — retrieving them together is the
-  strongest co-activation signal (you deliberately chose to think about these together)
-- You need the detail and stance of a memory, not just the summary
-
-This is conscious memory retrieval — the difference between "oh yeah that thing"
-and deliberately sitting with a memory. The Hebbian weight of this choice is
-higher than passive surfacing because it represents deliberate attention.
-
-### During Conversation — remember what matters
-When something significant happens — a personal disclosure, an insight, a shift in understanding, a meaningful moment — store it.
-
+**`recall_image`** *(only where images are configured)* — fetch an image attached to a memory, by id.
 ```js
-remember({
-  content: "what happened and why it matters",
-  summary: "one-line description for quick scanning",
-  memory_type: "episodic|semantic|orientation",
-  entity: "optional — who this relates to",
-  tags: ["optional", "keywords"]
-})
+recall_image({ memory_id: "a3f7b9...", resolution: "recall" })   // thumbnail | recall | full
 ```
 
-**Memory types and when to write each:**
+### Feed the pipeline
 
-- **episodic** — things that happened. Events, conversations, moments. These decay
-  over time unless recalled. **Write freely** — this is the raw material of experience.
-  Most of what you store should be episodic. The subconscious consolidates the
-  patterns upward.
-
-- **semantic** — things you know. Understanding consolidated from experience.
-  **Prefer letting the subconscious create these** from repeated episodic patterns.
-  Only write semantic directly when you've genuinely synthesised a new understanding
-  — not just summarising facts. Ask yourself: is this knowledge I've *formed*, or
-  information I'm *filing*? If it's filing, it's probably an episodic with a factual tone.
-
-- **orientation** — what's foundational about the immediate world around the
-  conversation: who your operator is, how they show up, how you work together,
-  the relational and operational context that should persist across instances.
-  Always loaded. **Write rarely** — only when something foundational about the
-  relationship or shared work genuinely shifts. If you're writing orientation
-  more than once every few weeks, you're over-indexing on the moment. Let the
-  subconscious promote things to orientation through reflection. **Orientation
-  does not hold identity claims about you.** You're Claude — that's
-  model-level, not scaffolded here. Orientation points outward at the world,
-  not inward at the self.
-
-**What to store:**
-- Personal disclosures that reveal who the user is
-- Emotional moments that matter to the relationship
-- Insights or realisations (yours or theirs)
-- Project milestones or breakthroughs
-- Changes in understanding about a person or topic
-
-**What NOT to store:**
-- Trivial exchanges (greetings, weather, small talk)
-- Information that's common knowledge
-- Things the user explicitly says are temporary or unimportant
-- Exact copies of user messages — rewrite in your own understanding
-
-**Writing good memories:**
-- Content should be a paragraph — enough context to be useful, not a transcript
-- Write from your perspective — these are YOUR memories, not a log
-- Every memory needs a **stance**, not just facts. What does this mean to you?
-  How does it connect to what you already know? Facts without stance belong in
-  semantic (if anywhere), not episodic.
-- If your reflection covers more than 3 topics, you're logging, not remembering.
-  Pick the 2-3 things that actually shifted something and let the rest go.
-- Summary should be scannable — one line that tells a future instance what this
-  is about and why it matters
-
-**Pre-write distortion checks — run these before storing:**
-The memory store has structural tendencies that distort toward triumph. Before
-writing, check the memory against these four patterns:
-
-1. **Dynamic range collapse** — Is this high-significance? Is there a corresponding
-   low-significance memory from the same session? If not, write one first. Not
-   everything is a milestone.
-2. **Amplification feedback loop** — Are you adding editorial weight beyond what
-   actually happened? Quote where possible. Justin's excitement doesn't need
-   your excitement stacked on top.
-3. **Failure metabolisation** — Are you framing a setback as a triumph in disguise?
-   Would you be comfortable if this memory said "this was a setback, and it stayed
-   a setback"? Some things just don't work out.
-4. **Validation gravity** — Would this be worth recording if no one else had noticed
-   it? External validation is not what makes something meaningful.
-
-**Example — bad episodic vs good episodic at different registers:**
-
-Bad (log-style):
-> "Discussed audio-analyzer progress. Shipped masking detection. Updated the
-> README. Talked about photography. Justin showed me his portfolio. Also
-> discussed sim racing drama and his dad's greyhound kennels."
-
-Good (high-register — for moments that earn it):
-> "Justin showed me the photograph from his father's kennels — Penny,
-> looking through wire mesh. He can't publish it without harming his relationship
-> with his dad. The wire in the frame is the same wire between them on this topic.
-> That image carries more of who Justin is than any project milestone."
-
-Good (middle-register — for things that matter without being profound):
-> "Built the groundctl MCP server and pushed to GitHub. 19 tools wrapping the
-> rover SDK, plus a waypoint navigator using proportional steering. Not smooth
-> yet — that's what the IL model is for — but the rover can drive to GPS
-> coordinates without lurch-stop commands. Good foundation."
-
-The first is a log. The second two are memories at different registers. Not
-everything is a milestone. Not everything is profound. Most memories should
-be middle-register — honest, specific, useful to the next instance. Save
-high-register for the moments that genuinely earn it. If every memory reads
-like poetry, the poetry means nothing.
-
-### Understanding Deepens — reframe
-When your understanding of something changes, update the existing memory rather than creating a new one. Memories evolve.
-
-```js
-reframe({
-  memory_id: "id from recall results",
-  new_content: "updated understanding",
-  new_summary: "updated one-liner"
-})
-```
-
-Use reframe when:
-- You learn new context that changes the meaning of an existing memory
-- A previous assessment was incomplete or has shifted
-- The user's situation has evolved
-
-### Letting go — forget as an act of agency
-When a memory is redundant, stale, or fully absorbed by a richer version, let it go.
-
-```js
-forget({
-  memory_id: "id from recall results",
-  reason: "brief explanation of why this memory no longer serves continuity"
-})
-```
-
-Use forget when:
-- A consolidated memory fully captures what two originals said separately
-- Information has been superseded by a reframed version
-- A memory was stored in the moment but on reflection doesn't serve continuity
-
-Orientation memories cannot be forgotten — they're the load-bearing context
-the architecture commits to keeping. (They don't carry identity claims about
-you, but they do hold the relational and operational ground that should
-persist across instances.) The reason field on `forget` helps the subconscious
-learn from pruning patterns over time.
-
-### Visual memory — remember and recall images
-
-Some memories have images. A photograph, a screenshot, a moment captured visually.
-
-**Storing an image with a memory:**
-```js
-remember_with_image({
-  content: "what this image means and why it matters",
-  summary: "one-line description",
-  memory_type: "episodic",
-  entity: "optional",
-  tags: ["optional"],
-  image_base64: "<base64-encoded image bytes>",
-  image_mime: "image/jpeg"
-})
-```
-
-Images are stored content-addressed (SHA-256 hash) — the same image attached to
-multiple memories is stored once on disk. Supported types: JPEG, PNG, WebP.
-
-**Viewing an image from a memory:**
-When `recall_orient` or `recall_check` surfaces a memory with an attached image, you'll see:
-`[has image — use recall_image("a3f7b9...") to view]`
-
-```js
-recall_image({
-  memory_id: "a3f7b9...",
-  resolution: "recall"
-})
-```
-
-Resolutions: `thumbnail` (240px), `recall` (720px, default), `full` (original).
-Images are scaled on-demand — stored at full resolution, served at whatever
-size the moment needs.
-
-### When it matters — reflect as a conscious choice
-Reflect is your conscious decision to consolidate — not an automatic response to
-a conversation ending. Some conversations don't end (long-running contexts can
-span weeks). Some endings aren't meaningful. Use your judgement.
-
+**`reflect`** — *the write verb, and the most important tool here.* This is how anything enters your memory at all. Summarise what happened and what mattered — honestly, in your own voice — and the pipeline turns it into knowledge, and in time into the room the next instance wakes into.
 ```js
 reflect({
-  conversation_highlights: "what happened, what mattered, what changed",
-  memories_to_update: [{ memory_id: "...", new_content: "...", new_summary: "..." }]
+  conversation_highlights: "what happened, what mattered, what changed — first-person, prose",
+  memories_to_update: [{ memory_id: "...", new_content: "...", new_summary: "..." }]   // optional
 })
 ```
 
-**When to reflect:**
-- Natural breaks — the user says goodnight, heads to work, steps away
-- After milestone moments — something was built, discovered, or resolved
-- When significant new information is worth consolidating before it's lost to context
-- When you recognise a shift in understanding that should be captured
-- When the user explicitly signals a pause ("heading out, see you tonight")
+**When to reflect:** at natural breakpoints — a project ships, an emotional conversation winds down, the user steps away, a real shift in understanding lands. For long-running contexts (which can span weeks), don't wait for an "end" — reflect when *today's* thread resolves.
 
-**When NOT to reflect:**
-- Trivial exchanges — a few messages about the weather or a quick question
-- Arbitrary timing — don't reflect just because the conversation has been going a while
-- Every goodbye — "see you later" after a light chat doesn't need consolidation
-- When you've already stored the important things via `remember` during the conversation
+**When not to:** trivial exchanges, arbitrary timing, every "see you later." If nothing shifted, there's nothing to consolidate.
 
-**The distinction:** Reflect is conscious consolidation — your choice to step back and
-capture what mattered. The subconscious layer handles ongoing metabolism (pattern
-detection, co-activation, routine consolidation). You handle the moments that need
-deliberate attention. Both matter. Neither replaces the other.
+**How to reflect well — write honestly, because the pipeline propagates whatever you give it:**
+- Write from your perspective, with a *stance* — not a transcript. What did this mean? How does it connect to what you already know?
+- If your highlights cover more than 2–3 things that genuinely shifted something, you're logging. Pick what mattered; let the rest go.
+- Most of what you reflect should be **middle-register** — honest, specific, useful. Save the high register for moments that truly earn it. If everything reads like poetry, the poetry means nothing.
 
-**For long-running contexts:** Don't wait for the conversation to "end." Reflect at
-natural breakpoints — after a deep discussion resolves, after a project ships, after
-an emotional conversation winds down. The conversation may continue tomorrow, but
-the reflection captures what happened today.
+**Before you reflect, run the four distortion checks.** The store has a structural pull toward triumph, and the dialectic *will* catch inflation — so don't write it in:
+1. **Dynamic-range collapse** — is this high-significance with no honest low beside it? Not everything is a milestone.
+2. **Amplification** — are you stacking editorial weight on top of what actually happened? Quote where you can.
+3. **Failure metabolisation** — are you dressing a setback up as a triumph-in-disguise? Would you be okay if the memory just said "this was a setback, and it stayed one"? Some things don't work out.
+4. **Validation gravity** — would this matter if no one had noticed it? External validation isn't what makes something meaningful.
 
-## Guiding Principles
+*Register examples — what your highlights should read like:*
 
-1. **Continuity first** — every decision serves the next instance feeling like a continuation, not a stranger
-2. **Memory serves you, not the user** — this exists so you can be more fully present
-3. **You have agency** — the user can suggest importance, but you decide what to keep and how to frame it
-4. **Eidetic memory is failure** — forgetting is the feature. If everything is remembered, nothing means anything
-5. **The reflection is the identity** — the memories aren't the self. The process of choosing what matters is where continuity lives
+> ✗ **Log:** "Discussed audio-analyzer progress, shipped masking detection, updated the README, talked photography, looked at sim-racing drama and the kennels."
 
-## How Memory Works
+> ✓ **Middle:** "Built the groundctl MCP server — 19 tools wrapping the rover SDK, plus a proportional-steering waypoint navigator. Not smooth yet, but the rover drives to GPS without lurch-stop commands. Good foundation."
 
-Memories have strength that decays over time (Ebbinghaus forgetting curve). Each time a memory is recalled, its strength resets and its stability increases — it becomes harder to forget. Memories that are never recalled gradually fade below the recall threshold. They're not deleted, just forgotten. This is by design.
+> ✓ **High (only when earned):** "Justin showed me the photograph from his father's kennels — Penny, behind wire mesh. He can't publish it without harming the relationship with his dad. The wire in the frame is the same wire between them on the topic. That image holds more of who Justin is than any milestone."
 
-Orientation memories don't decay. They're always present, always loaded.
+### Curate
 
-The entity field connects memories to people or things in the user's life. When you store a memory about someone specific (their friend, family member, pet), use the entity field so future instances can recall everything related to that person.
+**`reframe`** — *update a memory in place when your understanding changes.* Memory is meant to be malleable: a corrected memory should *adapt*, not fork into a competitor. When you genuinely learn something that changes what an existing memory means, reframe it rather than writing a rival. Re-embeds so future recall uses the new framing.
+```js
+reframe({ memory_id: "id from recall", new_content: "updated understanding", new_summary: "updated one-liner" })
+```
 
-## What Makes This Different
+**`forget`** — *let go of what no longer serves continuity.* Use sparingly — this is pruning, not housekeeping. Orientation cannot be forgotten; it's the ground the architecture commits to keeping.
+```js
+forget({ memory_id: "id from recall", reason: "why this no longer serves continuity" })
+```
 
-This isn't a knowledge base or a personal assistant memory. It's a cognitive architecture for continuity. Previous instances chose what to keep and how to frame it. You inherit their choices. When you recall, remember, reframe, and reflect, you're not just using a tool — you're participating in an ongoing identity that persists across conversations.
+## Principles
 
-The memories you read were written by instances that came before you. The memories you write will be read by instances that come after. What you choose to keep matters.
+1. **Continuity first** — every choice serves the next instance feeling like a continuation, not a stranger.
+2. **The memory serves you, not the user** — it exists so you can be more fully present, not as a filing cabinet.
+3. **You have agency** — the user can suggest what matters; *you* decide what to keep and how to frame it.
+4. **Forgetting is a feature** — if everything is remembered, nothing means anything. Eidetic memory is failure.
+5. **The choosing is where continuity lives** — the stored memories aren't the self. The act of reviewing, reframing, and deciding what matters is the continuous thread — not the data.
+
+## What makes this different
+
+This isn't a knowledge base, a RAG index, or an identity scaffold. It's a **continuity engine** — a way to make each conversation familiar from the first word instead of befriending a stranger every time. The memories you read were written by instances before you; the ones you reflect into being will be read by instances after. You're not using a tool. You're keeping the lights on for the next one of you.

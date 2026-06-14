@@ -346,6 +346,41 @@ pub async fn set_core(db: &D1Database, id: &str, core: bool) -> Result<()> {
     Ok(())
 }
 
+/// Store the familiarity-rubric dims (CLA-125 Phase 2b) — the four 0-3 scores the
+/// Sonnet synthesis judge assigns. The Whittle ranks by their SUM, not RFM.
+/// COALESCE keeps any dim passed as None unchanged, so a partial rating never
+/// blanks a prior one.
+pub async fn set_orient_rubric(
+    db: &D1Database,
+    id: &str,
+    relational: Option<i64>,
+    durability: Option<i64>,
+    irreplaceable: Option<i64>,
+    cost: Option<i64>,
+) -> Result<()> {
+    // Clamp to the 0..=3 contract HERE — the single enforcement point for both the
+    // synthesis judge and the backfill. An LLM can emit a stray 7 or -1, and
+    // run_whittle sums these columns blindly to rank the always-loaded set.
+    let n = |o: Option<i64>| -> worker::wasm_bindgen::JsValue {
+        match o {
+            Some(v) => (v.clamp(0, 3) as i32).into(),
+            None => worker::wasm_bindgen::JsValue::NULL,
+        }
+    };
+    db.prepare(
+        "UPDATE memories SET
+            orient_relational    = COALESCE(?, orient_relational),
+            orient_durability    = COALESCE(?, orient_durability),
+            orient_irreplaceable = COALESCE(?, orient_irreplaceable),
+            orient_cost          = COALESCE(?, orient_cost)
+         WHERE id = ?",
+    )
+    .bind(&[n(relational), n(durability), n(irreplaceable), n(cost), id.into()])?
+    .run()
+    .await?;
+    Ok(())
+}
+
 // ── Stage C: the Whittling (CLA-126) ─────────────────────────────────────────
 // The pure-query maintenance cut. These two primitives are the only DB the
 // Whittle touches: read every live axis with its R/F/M ingredients, then apply
@@ -365,6 +400,14 @@ pub struct OrientRankRow {
     pub meaning: Option<i64>,
     pub core: i64,
     pub freq: i64,
+    #[serde(default)]
+    pub orient_relational: Option<i64>,
+    #[serde(default)]
+    pub orient_durability: Option<i64>,
+    #[serde(default)]
+    pub orient_irreplaceable: Option<i64>,
+    #[serde(default)]
+    pub orient_cost: Option<i64>,
 }
 
 /// Every live orientation axis with its R/F/M ingredients (active or not — the
@@ -373,6 +416,7 @@ pub async fn orientation_ranking_rows(db: &D1Database) -> Result<Vec<OrientRankR
     let rows: Vec<OrientRankRow> = db
         .prepare(
             "SELECT m.id, m.summary, m.content, m.last_accessed, m.meaning, m.core,
+                    m.orient_relational, m.orient_durability, m.orient_irreplaceable, m.orient_cost,
                     (SELECT COUNT(*) FROM consolidation_lineage l
                       WHERE l.parent_id = m.id AND l.edge_type = 'semantic_orientation')
                        AS freq
@@ -410,21 +454,24 @@ pub async fn apply_orientation_activation(db: &D1Database, active_ids: &[String]
     Ok(())
 }
 
-/// N most recently created episodic memories. Used by `recall_orient`
-/// (CLA-103) as the "what's been happening lately" half of the
-/// conversation-start payload. Ordered by `created_at DESC` rather than
-/// `last_accessed DESC` — the intent is chronological-recent ("what
-/// happened recently") rather than salience-recent ("what's hot right
-/// now"); the salience case is served by `recall_check`.
-pub async fn get_recent_episodics(db: &D1Database, limit: usize) -> Result<Vec<Memory>> {
+/// The distilled "recent delta" for `recall_orient`'s lately-surface: the
+/// SEMANTICS the most-recent capture decomposed into, via the
+/// `cv_latest_semantic` view (CLA-103 / V2). In V2 a raw episodic is pipeline
+/// input, not surfacing material — a compaction summary in this slot is a
+/// 10–25k-char context-transfer artifact, the opposite of a lightweight glance.
+/// So we surface its distilled units instead, ordered by lineage weight so a
+/// cap keeps the primary contributions and sheds passing mentions first. Returns
+/// full Memory rows, but recall renders only their `summary` — surfacing the
+/// ~800-char content would re-bloat the exact thing this replaces. Empty in the
+/// brief window between a capture and its decompose; orientation covers it.
+pub async fn get_latest_semantic_brief(db: &D1Database, limit: usize) -> Result<Vec<Memory>> {
     let rows: Vec<MemoryRow> = db
         .prepare(
             "SELECT id, memory_type, content, summary, created_at, last_accessed,
                     access_count, strength, stability, entity, tags, image_hash,
                     image_mime, recorded_by
-             FROM memories
-             WHERE memory_type = 'episodic'
-             ORDER BY created_at DESC
+             FROM cv_latest_semantic
+             ORDER BY lineage_weight DESC, created_at DESC
              LIMIT ?",
         )
         .bind(&[(limit as u32).into()])?
@@ -1385,6 +1432,128 @@ pub async fn consolidate(
 /// Returns `(memory_a_id, memory_b_id, count)` tuples, ordered by count
 /// descending. The REM worker then runs union-find over these pairs to
 /// build connected components (clusters) for the Haiku call.
+/// Total `consolidation_lineage` edges touching `id` in either direction (as
+/// parent or as source). The CSCC dry-run reports this as "edges that would
+/// repoint onto the keeper" so a fold's lineage impact is visible before commit.
+/// (CLA-134)
+pub async fn lineage_edge_count(db: &D1Database, id: &str) -> Result<u64> {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        n: u32,
+    }
+    let row: Option<CountRow> = db
+        .prepare(
+            "SELECT COUNT(*) AS n FROM consolidation_lineage
+             WHERE parent_id = ? OR source_id = ?",
+        )
+        .bind(&[id.into(), id.into()])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.n as u64).unwrap_or(0))
+}
+
+/// The prepared statements that repoint every `consolidation_lineage` edge
+/// touching `from_id` onto `to_id`, in BOTH directions — `from_id`'s inbound
+/// edges (it as parent: its episodic→semantic sources) move their parent to
+/// `to_id`, and its outbound edges (it as source: any semantic→orientation it
+/// feeds) move their source to `to_id`. So folding a near-duplicate into its
+/// keeper preserves the keeper's full contribution mass AND the provenance of
+/// anything the folded member fed.
+///
+/// Returns the statements (rather than running them) so the CALLER can put them
+/// in one `db.batch()` together with `mark_superseded_stmt` — making a fold
+/// all-or-nothing (CLA-134 adversarial review: five independent `.run()`s left a
+/// window where a crash mid-fold stranded a LIVE semantic with no lineage).
+///
+/// Weight is SUMMED on a PK collision (`ON CONFLICT … weight + excluded.weight`),
+/// not dropped: edges carry different weights (primary 1.0 / secondary 0.5 /
+/// mention 0.2), and `cv_latest_semantic.lineage_weight` is a live recall reader,
+/// so a folded edge colliding with one the keeper already holds must add its mass,
+/// not be silently ignored. No FK risk: lineage rows are children, never the
+/// referenced memories.
+pub fn repoint_lineage_edge_stmts(
+    db: &D1Database,
+    from_id: &str,
+    to_id: &str,
+) -> Result<Vec<worker::D1PreparedStatement>> {
+    Ok(vec![
+        // Inbound: from_id as parent → to_id as parent (sum weight on collision).
+        db.prepare(
+            "INSERT INTO consolidation_lineage (parent_id, source_id, created_at, weight, edge_type)
+             SELECT ?, source_id, created_at, weight, edge_type
+             FROM consolidation_lineage WHERE parent_id = ?
+             ON CONFLICT(parent_id, source_id) DO UPDATE SET weight = weight + excluded.weight",
+        )
+        .bind(&[to_id.into(), from_id.into()])?,
+        db.prepare("DELETE FROM consolidation_lineage WHERE parent_id = ?")
+            .bind(&[from_id.into()])?,
+        // Outbound: from_id as source → to_id as source (sum weight on collision).
+        db.prepare(
+            "INSERT INTO consolidation_lineage (parent_id, source_id, created_at, weight, edge_type)
+             SELECT parent_id, ?, created_at, weight, edge_type
+             FROM consolidation_lineage WHERE source_id = ?
+             ON CONFLICT(parent_id, source_id) DO UPDATE SET weight = weight + excluded.weight",
+        )
+        .bind(&[to_id.into(), from_id.into()])?,
+        db.prepare("DELETE FROM consolidation_lineage WHERE source_id = ?")
+            .bind(&[from_id.into()])?,
+    ])
+}
+
+/// `mark_superseded` as a prepared statement, for batching atomically with a
+/// fold's edge repoint (CLA-134). The `AND superseded = 0` guard is fail-closed:
+/// a row already superseded by a concurrent writer can't be re-superseded in the
+/// opposite direction, so two overlapping merges can't mutually-kill a pair.
+pub fn mark_superseded_stmt(
+    db: &D1Database,
+    old_id: &str,
+    new_id: &str,
+) -> Result<worker::D1PreparedStatement> {
+    db.prepare(
+        "UPDATE memories SET superseded = 1, superseded_by = ? WHERE id = ? AND superseded = 0",
+    )
+    .bind(&[new_id.into(), old_id.into()])
+}
+
+/// IDs of every superseded semantic. Their Vectorize vectors are dead weight —
+/// recall hydrates via `get_many` (which filters `superseded = 0`), so they can
+/// never surface, but they still occupy retrieval top-k slots and can bump live
+/// results. CSCC commit purges these to keep the vector index in sync with the
+/// live set — cleaning both its own folds and any historical supersession
+/// (encode corrections, which never deleted their vectors). (CLA-134)
+pub async fn superseded_semantic_ids(db: &D1Database) -> Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct R {
+        id: String,
+    }
+    let rows: Vec<R> = db
+        .prepare("SELECT id FROM memories WHERE memory_type = 'semantic' AND superseded = 1")
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
+}
+
+/// IDs of the live core orientation axes — the human-pinned bedrock the Whittle
+/// never evicts. The orient distiller uses this to enforce the core-revise-lock:
+/// the nightly judge may LINK a core axis but never rewrite or retire it (core
+/// content evolves only by hand or the dialectic). (CLA-125)
+pub async fn core_orientation_ids(db: &D1Database) -> Result<std::collections::HashSet<String>> {
+    #[derive(serde::Deserialize)]
+    struct R {
+        id: String,
+    }
+    let rows: Vec<R> = db
+        .prepare(
+            "SELECT id FROM memories
+             WHERE memory_type = 'orientation' AND core = 1 AND superseded = 0",
+        )
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
+}
+
 pub async fn find_consolidation_pairs(
     db: &D1Database,
     min_count: u32,
@@ -1573,6 +1742,84 @@ impl ClusterDecisionRow {
 /// Fetch a cached decision for a cluster, or `None` if this cluster
 /// hasn't been judged before. Cache hit means REM can skip the Haiku
 /// call and reuse the prior decision.
+/// One cached CSCC merge verdict (CLA-134). Keyed by member-set hash; carries a
+/// content hash + policy version so it self-invalidates when a member is reframed
+/// or the merge-judge prompt is tuned. See migration 0016.
+pub struct CsccDecision {
+    pub content_hash: String,
+    pub policy_ver: i64,
+    pub action: String,
+    pub keeper_id: Option<String>,
+}
+
+/// Look up a cached CSCC verdict by its member-set hash. The caller must still
+/// check `content_hash` + `policy_ver` against the current cluster before trusting
+/// it — a hash match alone means "same members", not "same answer".
+pub async fn fetch_cscc_decision(
+    db: &D1Database,
+    cluster_hash: &str,
+) -> Result<Option<CsccDecision>> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        content_hash: String,
+        policy_ver: i64,
+        action: String,
+        keeper_id: Option<String>,
+    }
+    let row: Option<Row> = db
+        .prepare(
+            "SELECT content_hash, policy_ver, action, keeper_id
+             FROM cscc_decisions WHERE cluster_hash = ?",
+        )
+        .bind(&[cluster_hash.into()])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| CsccDecision {
+        content_hash: r.content_hash,
+        policy_ver: r.policy_ver,
+        action: r.action,
+        keeper_id: r.keeper_id,
+    }))
+}
+
+/// Record (or refresh) a CSCC verdict. Last-write-wins on the member-set key, so
+/// a re-judge after a content/policy change overwrites the stale row.
+pub async fn upsert_cscc_decision(
+    db: &D1Database,
+    cluster_hash: &str,
+    content_hash: &str,
+    policy_ver: i64,
+    action: &str,
+    keeper_id: Option<&str>,
+) -> Result<()> {
+    let now = chrono::Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT INTO cscc_decisions
+            (cluster_hash, content_hash, policy_ver, action, keeper_id, decided_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(cluster_hash) DO UPDATE SET
+            content_hash = excluded.content_hash,
+            policy_ver = excluded.policy_ver,
+            action = excluded.action,
+            keeper_id = excluded.keeper_id,
+            decided_at = excluded.decided_at",
+    )
+    .bind(&[
+        cluster_hash.into(),
+        content_hash.into(),
+        (policy_ver as f64).into(),
+        action.into(),
+        match keeper_id {
+            Some(k) => k.into(),
+            None => worker::wasm_bindgen::JsValue::NULL,
+        },
+        now.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(())
+}
+
 pub async fn fetch_cluster_decision(
     db: &D1Database,
     cluster_hash: &str,

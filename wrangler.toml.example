@@ -26,7 +26,10 @@ compatibility_date = "2026-05-01"
 [build]
 # Rust workers compile to wasm32 via worker-build (installs on demand).
 # Requires the `wasm32-unknown-unknown` target installed via rustup.
-command = "cargo install -q worker-build && worker-build --release"
+# Pinned to 0.8.4: 0.8.5 passes `--force-enable-abort-handler` to wasm-bindgen,
+# which the 0.2.123 CLI (the ceiling `worker = "0.8"` allows) doesn't support.
+# Revisit when the `worker` crate is bumped.
+command = "cargo install -q worker-build --version 0.8.4 && worker-build --release"
 
 # ──────────────────────────────────────────────────────────────────────
 # D1 — primary memory store. Replaces the local SQLite file.
