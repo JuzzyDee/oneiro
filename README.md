@@ -212,6 +212,22 @@ Drag `oneiro-skill/oneiro-skill.zip` into Claude.ai → Settings → Skills. It 
 
 The skill tells Claude *when* to call `recall_orient`. The hook makes orientation arrive *before* Claude evaluates any tool, closing the bootstrap window where an instance defaults to its built-in memory and never looks. Wire `scripts/oneiro-orient.sh` into the `SessionStart` and `PreCompact` hooks in `~/.claude/settings.json`, with a service key in your keychain (`oneiro-orient`) and `ONEIRO_WORKER_URL` exported. Fail-safe by design: if anything's misconfigured the script exits 0 silently and the session continues normally.
 
+### Install the capture hook (Claude Code only)
+
+This is how Claude Code *writes* memories. Other clients (Claude.ai, mobile) capture through the MCP `remember` / `reflect` tools; Claude Code captures automatically from its **compaction summary** instead — a `PostCompact` hook POSTs the summary to `/encode` as a raw episodic, and the nightly pipeline decomposes and distils it. Wire it and recall *plus* capture work end to end; skip it and recall still works but Code never records anything.
+
+Wire `scripts/oneiro-encode.sh` into the `PostCompact` hook in `~/.claude/settings.json`. It reuses the orient hook's config — `ONEIRO_WORKER_URL` exported and the same Hook-role key (`ONEIRO_HOOK_TOKEN`, falling back to `ONEIRO_ORIENT_TOKEN` or the macOS keychain entry `oneiro-orient`), so one key serves both. Fail-safe by design: any misconfiguration exits 0 silently and the session continues.
+
+**Capture is default-deny — this is the step that's easy to miss.** The hook only fires for a project that has a `.oneiro-capture` marker file in its directory *or any ancestor*. Drop an empty one in each project you want remembered:
+
+```bash
+touch .oneiro-capture
+```
+
+No marker, no capture — silently, with no error to tell you why. That's the privacy gate: work or client code without a marker is never sent, no redaction required. **If you wire the hook and nothing's saving, you're almost certainly missing the marker.**
+
+> **Cross-platform note:** the hook is a bash script needing `jq` and `curl` — native on macOS/Linux; on Windows it needs WSL or Git Bash with both on `PATH`. It never guesses where the transcript lives (Claude Code passes the path in), so location is not a concern — but the keychain token fallback is macOS-only, so on Linux/Windows set `ONEIRO_HOOK_TOKEN` as an environment variable.
+
 ### Verify it's running
 
 ```bash
