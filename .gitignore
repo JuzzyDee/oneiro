@@ -29,3 +29,6 @@ restore.sql
 # Per-machine opt-in marker: its presence enables PostCompact capture on THIS
 # machine (default-deny). Machine-local, never the repo's to decide.
 .oneiro-capture
+
+# stray run logs (tee-without-/tmp accidents)
+*.log

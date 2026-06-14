@@ -94,12 +94,15 @@ prompt_secret() {
     printf -v "$var_name" '%s' "$input"
 }
 
-# Detect GNU vs BSD date. macOS's BSD date returns the current date
-# (exit 0) for `date --version`, so we can't use exit code — we have
-# to check the output content. GNU coreutils' date prints "GNU coreutils"
-# on first line.
+# Detect whether `date` speaks GNU-style syntax (`-d <when>`) vs BSD/macOS
+# (`-j -f`). Probe the CAPABILITY, not the version string: uutils coreutils
+# (a Rust, GNU-compatible `date` now shipping on some Linux/WSL setups) parses
+# `-d` fine but its `--version` says "uutils coreutils", so a "GNU coreutils"
+# string-match wrongly routed it to the BSD branch and `date -j` blew up. The
+# probe is true iff `-d @epoch` resolves (GNU and uutils); BSD date can't (its
+# `-d` is the unrelated DST flag), so it errors/empties and we take the BSD path.
 _is_gnu_date() {
-    date --version 2>&1 | head -1 | grep -qi 'GNU coreutils'
+    [ "$(date -u -d @0 +%Y 2>/dev/null)" = "1970" ]
 }
 
 # Cross-platform date arithmetic for "6 months from now in $TZ".

@@ -33,6 +33,8 @@ mod worker_orient_distill;
 mod worker_rem;
 mod worker_encode;
 mod worker_encode_batch;
+mod worker_cscc;
+mod worker_adas;
 mod worker_rem_audit;
 mod worker_store;
 mod worker_vectorize;
@@ -95,6 +97,27 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // of `?min_size=` (default 2). Lets us tune the consolidation threshold
         // against the real store before building the write-bearing pass.
         (Method::Get, "/admin/cluster-preview") => admin_cluster_preview_endpoint(&env, &req).await,
+
+        // Admin: cscc-calibrate (CLA-134). DRY-RUN merge calibrator — clusters the
+        // semantic layer at `?threshold=` (default 0.90) and runs each cluster
+        // through the Haiku merge/keep-distinct judge. NO writes; returns verdicts
+        // + reasons so the judgment can be tuned before execution plumbing exists.
+        (Method::Get, "/admin/cscc-calibrate") => admin_cscc_calibrate_endpoint(&env, &req).await,
+
+        // Admin: cscc-execute (CLA-134). Clusters + judges like calibrate, then
+        // folds each confirmed MERGE into its keeper. `?commit=false` (default) is
+        // a DRY RUN — no writes, shows the fold plan; `commit=true` writes.
+        (Method::Get, "/admin/cscc-execute") => admin_cscc_execute_endpoint(&env, &req).await,
+
+        // Admin: split-preview (CLA-134, ADAS). READ-ONLY conflation detector —
+        // ranks live semantics by over-creation (orientation axes fed) + length,
+        // no Haiku, no writes. Calibrate-first for the split half of defrag.
+        (Method::Get, "/admin/split-preview") => admin_split_preview_endpoint(&env, &req).await,
+
+        // Admin: split-judge (CLA-134, ADAS). DRY-RUN — Haiku reads each
+        // pre-filtered candidate whole and judges keep-vs-split. No writes;
+        // surfaces the crown-jewel `protected` flag beside each verdict.
+        (Method::Get, "/admin/split-judge") => admin_split_judge_endpoint(&env, &req).await,
 
         // Admin: decompose-preview (CLA-134 / encode rebuild, Step 0). Runs the
         // decompose stage on one episodic (?episodic_id=<id or 8-char prefix>)
@@ -542,6 +565,7 @@ fn whittle_json(ranking: &[worker_orient_distill::WhittleRanking]) -> serde_json
                 "days_since": (r.days_since * 10.0).round() / 10.0,
                 "freq": r.freq,
                 "meaning": r.meaning,
+                "rubric": [r.relational, r.durability, r.irreplaceable, r.cost],
             }))
             .collect::<Vec<_>>(),
     })
@@ -619,6 +643,8 @@ async fn admin_orient_backfill_endpoint(env: &Env, req: &mut Request) -> Result<
                     "id": &o.id[..o.id.len().min(8)],
                     "summary": o.summary,
                     "meaning_set": o.meaning_set,
+                    "rubric_set": o.rubric_set,
+                    "rubric": [o.relational, o.durability, o.irreplaceable, o.cost],
                     "carved": o.carved.map(|(f, t)| serde_json::json!({ "from": f, "to": t })),
                 }))
                 .collect();
@@ -760,6 +786,219 @@ async fn admin_encode_diagnostics_endpoint(env: &Env, req: &Request) -> Result<R
                 }))
                 .collect();
             Ok(serde_json::json!({ "count": out.len(), "diagnostics": out }))
+        })
+        .await;
+
+    match result {
+        Ok(v) => {
+            let mut resp = Response::ok(v.to_string())?;
+            resp.headers_mut().set("content-type", "application/json")?;
+            Ok(resp)
+        }
+        Err((code, msg)) => Response::error(msg, code),
+    }
+}
+
+/// GET /admin/split-judge?min_axes=2&min_len=800&limit=20 — ADAS split-judge
+/// DRY-RUN (CLA-134). Pre-filters candidates (over-creation OR length), then Haiku
+/// reads each WHOLE and judges keep-vs-split. NO writes. Surfaces `protected`
+/// (feeds a core/pinned axis) beside each verdict so the crown-jewel guard is
+/// visible. Calibrate the prompt on this output before separation is built.
+/// Gated on `encode`.
+async fn admin_split_judge_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+
+    let url = req.url().ok();
+    let param = |key: &str| -> Option<String> {
+        url.as_ref().and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        })
+    };
+    let min_axes: i64 = param("min_axes").and_then(|s| s.parse().ok()).unwrap_or(2);
+    let min_len: i64 = param("min_len").and_then(|s| s.parse().ok()).unwrap_or(800);
+    let limit: usize = param("limit").and_then(|s| s.parse().ok()).unwrap_or(20);
+
+    let db = env.d1("DB")?;
+    let result: std::result::Result<serde_json::Value, (u16, String)> = worker_auth_ctx::AUTH_CTX
+        .scope(auth, async move {
+            worker_auth_ctx::check_scope(&db, "encode")
+                .await
+                .map_err(|e| (403u16, e))?;
+            worker_adas::split_judge_preview(env, &db, min_axes, min_len, limit)
+                .await
+                .map_err(|e| (500u16, format!("split judge: {:?}", e)))
+        })
+        .await;
+
+    match result {
+        Ok(v) => {
+            let mut resp = Response::ok(v.to_string())?;
+            resp.headers_mut().set("content-type", "application/json")?;
+            Ok(resp)
+        }
+        Err((code, msg)) => Response::error(msg, code),
+    }
+}
+
+/// GET /admin/split-preview?min_axes=2&min_len=800&limit=50 — ADAS conflation
+/// detector preview (CLA-134). READ-ONLY, no Haiku, no writes: ranks live
+/// semantics by the over-creation signal (distinct orientation axes fed) + char
+/// length, returns the distribution + candidates so the split detector can be
+/// calibrated before separation is built. Gated on `encode`.
+async fn admin_split_preview_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+
+    let url = req.url().ok();
+    let param = |key: &str| -> Option<String> {
+        url.as_ref().and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        })
+    };
+    let min_axes: i64 = param("min_axes").and_then(|s| s.parse().ok()).unwrap_or(2);
+    let min_len: i64 = param("min_len").and_then(|s| s.parse().ok()).unwrap_or(800);
+    let limit: usize = param("limit").and_then(|s| s.parse().ok()).unwrap_or(50);
+
+    let db = env.d1("DB")?;
+    let result: std::result::Result<serde_json::Value, (u16, String)> = worker_auth_ctx::AUTH_CTX
+        .scope(auth, async move {
+            worker_auth_ctx::check_scope(&db, "encode")
+                .await
+                .map_err(|e| (403u16, e))?;
+            worker_adas::split_candidate_preview(&db, min_axes, min_len, limit)
+                .await
+                .map_err(|e| (500u16, format!("split preview: {:?}", e)))
+        })
+        .await;
+
+    match result {
+        Ok(v) => {
+            let mut resp = Response::ok(v.to_string())?;
+            resp.headers_mut().set("content-type", "application/json")?;
+            Ok(resp)
+        }
+        Err((code, msg)) => Response::error(msg, code),
+    }
+}
+
+/// GET /admin/cscc-execute?threshold=0.90&min_size=2&commit=false — CSCC merge
+/// executor (CLA-134). Clusters + judges like cscc-calibrate, then for each MERGE
+/// verdict folds the non-keeper members into the keeper (repoint lineage edges,
+/// supersede the folded). `commit=false` (default) is a DRY RUN — no writes, just
+/// the fold plan. `commit=true` writes. Gated on `encode`. A store backup before
+/// the first real commit is prudent; folds are reversible (superseded rows kept).
+async fn admin_cscc_execute_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+
+    let url = req.url().ok();
+    let param = |key: &str| -> Option<String> {
+        url.as_ref().and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        })
+    };
+    let threshold: f64 = param("threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(worker_cscc::DEFAULT_THRESHOLD);
+    let min_size: usize = param("min_size").and_then(|s| s.parse().ok()).unwrap_or(2);
+    let commit: bool = param("commit")
+        .map(|s| s == "true" || s == "1")
+        .unwrap_or(false);
+    let use_cache: bool = !param("nocache").map(|s| s == "true" || s == "1").unwrap_or(false);
+
+    let db = env.d1("DB")?;
+    let result: std::result::Result<serde_json::Value, (u16, String)> = worker_auth_ctx::AUTH_CTX
+        .scope(auth, async move {
+            worker_auth_ctx::check_scope(&db, "encode")
+                .await
+                .map_err(|e| (403u16, e))?;
+            worker_cscc::execute_merges(env, &db, threshold, min_size, commit, use_cache)
+                .await
+                .map_err(|e| (500u16, format!("cscc execute: {:?}", e)))
+        })
+        .await;
+
+    match result {
+        Ok(v) => {
+            let mut resp = Response::ok(v.to_string())?;
+            resp.headers_mut().set("content-type", "application/json")?;
+            Ok(resp)
+        }
+        Err((code, msg)) => Response::error(msg, code),
+    }
+}
+
+/// GET /admin/cscc-calibrate?threshold=0.90&min_size=2 — DRY-RUN merge calibrator
+/// (CLA-134). Clusters the live semantic layer by cosine proximity (same path as
+/// cluster-preview) and runs each cluster through a Haiku merge/keep-distinct
+/// judge. NO writes — returns the verdicts + reasons so the merge judgment can be
+/// tuned on real output before any execution plumbing is wired. Gated on `encode`.
+async fn admin_cscc_calibrate_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+
+    let url = req.url().ok();
+    let param = |key: &str| -> Option<String> {
+        url.as_ref().and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.into_owned())
+        })
+    };
+    let threshold: f64 = param("threshold")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(worker_cscc::DEFAULT_THRESHOLD);
+    let min_size: usize = param("min_size").and_then(|s| s.parse().ok()).unwrap_or(2);
+    let use_cache: bool = !param("nocache").map(|s| s == "true" || s == "1").unwrap_or(false);
+
+    let db = env.d1("DB")?;
+    let result: std::result::Result<serde_json::Value, (u16, String)> = worker_auth_ctx::AUTH_CTX
+        .scope(auth, async move {
+            worker_auth_ctx::check_scope(&db, "encode")
+                .await
+                .map_err(|e| (403u16, e))?;
+            worker_cscc::calibrate(env, &db, threshold, min_size, use_cache)
+                .await
+                .map_err(|e| (500u16, format!("cscc calibrate: {:?}", e)))
         })
         .await;
 
