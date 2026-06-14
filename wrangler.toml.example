@@ -114,6 +114,20 @@ id = "CHANGE_ME_AFTER_SETUP"
 crons = ["0 14 * * *", "30 14 * * *", "0 8 * * *"]
 
 # ──────────────────────────────────────────────────────────────────────
+# Vars — the runtime's copy of the cron roster. Cloudflare only tells the
+# worker WHICH expression fired (via event.cron()), not which job it was,
+# so scheduled() routes by matching the fired cron against these three.
+# They MUST mirror [triggers] above. setup.sh writes both blocks together
+# so they can't drift; if you hand-edit the schedule, change BOTH — or
+# just re-run ./scripts/setup.sh. Unset vars fall back to built-in
+# defaults (the AEST values below), so an older deploy keeps working.
+# ──────────────────────────────────────────────────────────────────────
+[vars]
+CRON_CSCC = "0 14 * * *"
+CRON_ORIENT = "30 14 * * *"
+CRON_DIALECTIC = "0 8 * * *"
+
+# ──────────────────────────────────────────────────────────────────────
 # Queues — the capture pipeline. Producers: POST /encode (the CLI hook)
 # and the `reflect` MCP tool (all clients). Consumer: writes the episodic
 # then encodes it to semantics (worker_encode::process_capture), decoupling

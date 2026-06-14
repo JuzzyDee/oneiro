@@ -175,6 +175,37 @@ toml_set_crons() {
     ' wrangler.toml > wrangler.toml.tmp && mv wrangler.toml.tmp wrangler.toml
 }
 
+# Mirror the cron roster into the [vars] block. The worker routes by matching
+# event.cron() against CRON_CSCC/CRON_ORIENT/CRON_DIALECTIC (Cloudflare doesn't
+# say which job fired), so these MUST equal the [triggers] crons. We write both
+# from the same source here so they can't drift. If the [vars] keys are absent
+# (an in-place upgrade from a pre-vars wrangler.toml), append the block.
+toml_set_cron_vars() {
+    local cscc="$1"
+    local orient="$2"
+    local dialectic="$3"
+    if [ "$DRY_RUN" = true ]; then
+        printf '  %s[dry-run]%s would set CRON_CSCC/CRON_ORIENT/CRON_DIALECTIC = "%s"/"%s"/"%s"\n' \
+            "${YELLOW}" "${RESET}" "$cscc" "$orient" "$dialectic"
+        return 0
+    fi
+    if grep -q '^CRON_CSCC = ' wrangler.toml; then
+        awk -v cscc="$cscc" -v orient="$orient" -v dia="$dialectic" '
+            /^CRON_CSCC = /      { printf "CRON_CSCC = \"%s\"\n", cscc; next }
+            /^CRON_ORIENT = /    { printf "CRON_ORIENT = \"%s\"\n", orient; next }
+            /^CRON_DIALECTIC = / { printf "CRON_DIALECTIC = \"%s\"\n", dia; next }
+            { print }
+        ' wrangler.toml > wrangler.toml.tmp && mv wrangler.toml.tmp wrangler.toml
+    else
+        {
+            printf '\n[vars]\n'
+            printf 'CRON_CSCC = "%s"\n' "$cscc"
+            printf 'CRON_ORIENT = "%s"\n' "$orient"
+            printf 'CRON_DIALECTIC = "%s"\n' "$dialectic"
+        } >> wrangler.toml
+    fi
+}
+
 # ──── Banner ─────────────────────────────────────────────────────────
 
 cat <<EOF
@@ -530,6 +561,7 @@ ORIENT_CRON="${ORIENT_M} ${ORIENT_H} * * *"
 DIALECTIC_CRON="${DIA_M} ${DIA_H} * * *"
 
 toml_set_crons "$CSCC_CRON" "$ORIENT_CRON" "$DIALECTIC_CRON"
+toml_set_cron_vars "$CSCC_CRON" "$ORIENT_CRON" "$DIALECTIC_CRON"
 ok "CSCC:      ${CSCC_LOCAL} ${TZ_NAME} = ${CSCC_UTC} UTC (cron: ${CSCC_CRON})"
 ok "Orient:    ${ORIENT_UTC} UTC (cron: ${ORIENT_CRON}) — 30m after CSCC"
 ok "Dialectic: ${DIALECTIC_LOCAL} ${TZ_NAME} = ${DIALECTIC_UTC} UTC (cron: ${DIALECTIC_CRON})"
