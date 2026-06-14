@@ -89,25 +89,29 @@ binding = "VERSION_CACHE"
 id = "CHANGE_ME_AFTER_SETUP"
 
 # ──────────────────────────────────────────────────────────────────────
-# Cron triggers — two cognitive loops on different schedules.
+# Cron triggers — the nightly cognitive-write roster (CLA-134/125/128). All three
+# run under the single shared `cognitive` lease (single-flight), staggered so they
+# never overlap, and CSCC cleans the semantic layer before orient distils it.
 #
-#   REM consolidator (CLA-87)
-#     Hebbian clustering + Haiku judgment + additive dispatch.
-#     Default: 14:00 UTC (= 00:00 AEST). The setup script rewrites this
-#     to match the timezone you choose.
+#   CSCC defrag (CLA-134)
+#     Whole-store cosine-cluster consolidation — merges near-duplicate semantics.
+#     Default: 14:00 UTC (= 00:00 AEST). The setup script rewrites this for your TZ.
 #
-#   Dialectic (CLA-95)
-#     Calibration scrutiny of recent semantic memories. Stage 1 is
-#     judgment-only; Stages 2/3 add adversarial dialogue + actions.
-#     Default: 08:00 UTC (= 18:00 AEST). Setup script rewrites for
-#     your timezone.
+#   orient-run (CLA-125)
+#     Semantic → orientation distillation + the whittle re-settle.
+#     Default: 14:30 UTC (= 00:30 AEST), staggered 30m after CSCC.
 #
-# Cron expressions are UTC. If your timezone observes DST, your local
-# schedule will shift by an hour seasonally — re-run `./scripts/setup.sh`
-# at the boundary to update, or just accept the drift.
+#   Dialectic (CLA-128)
+#     Anti-mythology pass over the always-loaded orientation layer (adversarial,
+#     reversible). Default: 08:00 UTC (= 18:00 AEST).
+#
+# Hebbian REM (the old CLA-87 loop) is RETIRED — CSCC replaced it; no longer scheduled.
+# Cron expressions are UTC. If your timezone observes DST, your local schedule will
+# shift by an hour seasonally — re-run `./scripts/setup.sh` at the boundary, or
+# accept the drift.
 # ──────────────────────────────────────────────────────────────────────
 [triggers]
-crons = ["0 14 * * *", "0 8 * * *"]
+crons = ["0 14 * * *", "30 14 * * *", "0 8 * * *"]
 
 # ──────────────────────────────────────────────────────────────────────
 # Queues — the capture pipeline. Producers: POST /encode (the CLI hook)

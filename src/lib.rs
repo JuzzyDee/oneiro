@@ -25,6 +25,7 @@ mod worker_dialectic;
 mod worker_dialectic_audit;
 mod worker_dialectic_dispatch;
 mod worker_embed;
+mod worker_lease;
 mod worker_mcp;
 mod worker_mmr;
 mod worker_oauth;
@@ -1393,9 +1394,29 @@ async fn handle_token_form(env: &Env, req: &mut Request) -> Result<Response> {
 #[event(scheduled)]
 pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let cron = event.cron();
+    // The nightly cognitive-write roster (CLA-134/125/128). Each job runs under the
+    // single shared `cognitive` lease (single-flight), staggered so they never
+    // overlap — CSCC cleans the semantic layer before orient distils it. Hebbian
+    // REM is retired (CSCC replaced it); no longer scheduled.
     match cron.as_str() {
-        "0 8 * * *" => run_dialectic(&env).await,
-        "0 14 * * *" => run_rem(&env).await,
+        "0 14 * * *" => {
+            if let Some(t) = acquire_cognitive(&env, "cscc").await {
+                run_cscc(&env).await;
+                release_cognitive(&env, &t).await;
+            }
+        }
+        "30 14 * * *" => {
+            if let Some(t) = acquire_cognitive(&env, "orient").await {
+                run_orient_cron(&env).await;
+                release_cognitive(&env, &t).await;
+            }
+        }
+        "0 8 * * *" => {
+            if let Some(t) = acquire_cognitive(&env, "dialectic").await {
+                run_dialectic(&env).await;
+                release_cognitive(&env, &t).await;
+            }
+        }
         other => {
             worker::console_error!(
                 "Unknown cron trigger: {} — no handler dispatched",
@@ -1562,6 +1583,10 @@ async fn poll_and_reschedule(
     }
 }
 
+// Hebbian REM is RETIRED from the cron roster — CSCC's whole-store defrag replaced
+// it. Kept compiling for now; full teardown of the worker_rem subsystem (+ its audit
+// and the native path) is a flagged follow-up cleanup, not done here.
+#[allow(dead_code)]
 async fn run_rem(env: &Env) {
     match worker_rem::run(env).await {
         Ok(summary) => {
@@ -1601,5 +1626,80 @@ async fn run_dialectic(env: &Env) {
         Err(e) => {
             worker::console_error!("Dialectic run failed catastrophically: {:?}", e);
         }
+    }
+}
+
+// ── Cognitive-write lease wiring (CLA-134) ──────────────────────────────────
+// The nightly roster (CSCC, orient, dialectic) all take the single shared
+// `cognitive` lease so no two ever write the store at once. acquire returns None
+// (with a log) when another job holds it or the lease store errors — the caller
+// skips that tick; release is best-effort (the lease self-expires via TTL anyway).
+
+async fn acquire_cognitive(env: &Env, label: &str) -> Option<String> {
+    match worker_lease::acquire(env, worker_lease::COGNITIVE).await {
+        Ok(Some(token)) => Some(token),
+        Ok(None) => {
+            worker::console_log!(
+                "cron {}: cognitive lease held by another job — skipping this tick",
+                label
+            );
+            None
+        }
+        Err(e) => {
+            worker::console_error!(
+                "cron {}: lease acquire failed ({:?}) — skipping to stay single-flight",
+                label,
+                e
+            );
+            None
+        }
+    }
+}
+
+async fn release_cognitive(env: &Env, token: &str) {
+    if let Err(e) = worker_lease::release(env, worker_lease::COGNITIVE, token).await {
+        worker::console_error!(
+            "cron: cognitive lease release failed ({:?}) — will self-expire via TTL",
+            e
+        );
+    }
+}
+
+/// Generous per-run cap for the nightly orient distillation — a day's edged
+/// semantics is far under this, so it never silently drops the daily delta.
+const ORIENT_CRON_LIMIT: u32 = 200;
+
+/// CSCC nightly: whole-store cosine-cluster consolidation at the calibrated 0.90
+/// threshold, committing, with the decision cache on.
+async fn run_cscc(env: &Env) {
+    let db = match env.d1("DB") {
+        Ok(db) => db,
+        Err(e) => {
+            worker::console_error!("CSCC run: no DB binding ({:?})", e);
+            return;
+        }
+    };
+    match worker_cscc::execute_merges(env, &db, 0.90, 2, true, true).await {
+        Ok(report) => worker::console_log!("CSCC run complete: {}", report),
+        Err(e) => worker::console_error!("CSCC run failed: {:?}", e),
+    }
+}
+
+/// orient-run nightly: distil the last 24h of edged semantics into orientation,
+/// then re-settle the always-loaded set (the whittle runs at the end of the batch).
+async fn run_orient_cron(env: &Env) {
+    let db = match env.d1("DB") {
+        Ok(db) => db,
+        Err(e) => {
+            worker::console_error!("orient run: no DB binding ({:?})", e);
+            return;
+        }
+    };
+    let since = (chrono::Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+    match worker_orient_distill::run_orient_batch(env, &db, &since, ORIENT_CRON_LIMIT).await {
+        Ok(outcomes) => {
+            worker::console_log!("orient run complete: {} drivers processed", outcomes.len())
+        }
+        Err(e) => worker::console_error!("orient run failed: {:?}", e),
     }
 }
