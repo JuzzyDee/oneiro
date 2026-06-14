@@ -1381,16 +1381,19 @@ async fn handle_token_form(env: &Env, req: &mut Request) -> Result<Response> {
 
 /// Scheduled handler — dispatched by cron triggers declared in
 /// wrangler.toml. We use the cron pattern that fired (via `event.cron()`)
-/// to decide which cognitive loop to invoke:
+/// to decide which cognitive-write loop to invoke, each under the shared
+/// single-flight `cognitive` lease:
 ///
-///   - `0 14 * * *` (14:00 UTC / 00:00 AEST) → REM consolidator
-///   - `0 8 * * *`  (08:00 UTC / 18:00 AEST) → Dialectic (CLA-95)
+///   - `0 14 * * *`  (14:00 UTC / 00:00 AEST) → CSCC defrag (CLA-134)
+///   - `30 14 * * *` (14:30 UTC / 00:30 AEST) → orient-run distillation (CLA-125)
+///   - `0 8 * * *`   (08:00 UTC / 18:00 AEST) → Dialectic over orientation (CLA-128)
 ///
-/// Unknown cron patterns are deliberately not dispatched — they log an
-/// error and no-op. Per CLA-95 PR #7 review: silent-and-mostly-fine
-/// (fall through to REM) is worse than visible-and-wrong (log + no-op)
-/// when a typo'd cron entry hits production. Adding a new cron requires
-/// adding a match arm here.
+/// Staggered so they never overlap; CSCC cleans the semantic layer before
+/// orient distils it. Hebbian REM (the old CLA-87 loop) is retired — no longer
+/// scheduled. Unknown cron patterns are deliberately not dispatched — they log
+/// an error and no-op. Per CLA-95 PR #7 review: visible-and-wrong (log + no-op)
+/// beats silent-and-mostly-fine when a typo'd cron entry hits production.
+/// Adding a new cron requires adding a match arm here.
 #[event(scheduled)]
 pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let cron = event.cron();
