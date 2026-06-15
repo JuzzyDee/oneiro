@@ -202,16 +202,27 @@ pub async fn query_top_k_with_vectors(
 /// Ids not present in the index are silently dropped from the returned
 /// list (Cloudflare's behaviour, not ours). Caller should not assume
 /// the response length matches the request length.
+///
+/// Vectorize hard-caps getByIds at 20 ids per call, so larger id lists are
+/// chunked into <=20-id batches and the results concatenated. The CLA-109
+/// recall path and CSCC both routinely exceed 20 candidates.
 pub async fn get_by_ids(env: &Env, ids: &[&str]) -> Result<Vec<StoredVector>> {
+    // Cloudflare Vectorize returns VECTOR_GET_ERROR (40007) above 20 ids per
+    // getByIds call; chunk to stay under the cap, transparently to callers.
+    const MAX_GET_BY_IDS: usize = 20;
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let index = from_env(env, "VECTORS")?;
-    let ids_arr: Array = ids.iter().map(|s| JsValue::from_str(s)).collect();
-    let promise = index.get_by_ids(ids_arr.into()).map_err(js_err)?;
-    let result = JsFuture::from(promise).await.map_err(js_err)?;
-    // getByIds returns a bare array, not a `{matches: [...]}` envelope.
-    let vectors: Vec<StoredVector> = serde_wasm_bindgen::from_value(result)
-        .map_err(|e| Error::JsError(format!("Vectorize getByIds parse failed: {}", e)))?;
-    Ok(vectors)
+    let mut out: Vec<StoredVector> = Vec::with_capacity(ids.len());
+    for chunk in ids.chunks(MAX_GET_BY_IDS) {
+        let ids_arr: Array = chunk.iter().map(|s| JsValue::from_str(s)).collect();
+        let promise = index.get_by_ids(ids_arr.into()).map_err(js_err)?;
+        let result = JsFuture::from(promise).await.map_err(js_err)?;
+        // getByIds returns a bare array, not a `{matches: [...]}` envelope.
+        let vectors: Vec<StoredVector> = serde_wasm_bindgen::from_value(result)
+            .map_err(|e| Error::JsError(format!("Vectorize getByIds parse failed: {}", e)))?;
+        out.extend(vectors);
+    }
+    Ok(out)
 }
