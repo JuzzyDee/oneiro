@@ -648,7 +648,13 @@ async fn haiku_tool_call(
     });
 
     let mut headers = Headers::new();
-    headers.set("Authorization", &format!("Bearer {}", oauth_token))?;
+    // Token-type aware (CLA-117), mirroring cscc/orient/encode: an `sk-ant-api…`
+    // key authenticates via `x-api-key`; an `sk-ant-oat…` OAuth token via Bearer.
+    if oauth_token.starts_with("sk-ant-api") {
+        headers.set("x-api-key", &oauth_token)?;
+    } else {
+        headers.set("Authorization", &format!("Bearer {}", oauth_token))?;
+    }
     headers.set("anthropic-version", "2023-06-01")?;
     headers.set("content-type", "application/json")?;
 
