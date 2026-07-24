@@ -1182,6 +1182,7 @@ fn run_migrate(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let mut role: Option<api_key::Role> = None;
+    let mut hash_existing: Option<String> = None;
     let mut quiet = false;
     let mut i = 0;
     while i < args.len() {
@@ -1192,10 +1193,17 @@ fn run_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                     .ok_or("--role requires a value (e.g. --role rover)")?;
                 role = Some(api_key::Role::from_str(value).ok_or_else(|| {
                     format!(
-                        "unknown role: {}. Known roles: rover, hook",
+                        "unknown role: {}. Known roles: rover, hook, beacon",
                         value
                     )
                 })?);
+                i += 2;
+            }
+            "--hash" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or("--hash requires the existing raw key (e.g. --hash mk_hook_...)")?;
+                hash_existing = Some(value.clone());
                 i += 2;
             }
             "--quiet" => {
@@ -1203,12 +1211,16 @@ fn run_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 i += 1;
             }
             "--help" | "-h" => {
-                eprintln!("Usage: oneiro keygen --role <role> [--quiet]");
+                eprintln!("Usage: oneiro keygen --role <role> [--hash <raw-key>] [--quiet]");
                 eprintln!();
-                eprintln!("Roles: rover, hook");
+                eprintln!("Roles: rover, hook, beacon");
                 eprintln!();
-                eprintln!("--quiet  Emit only the raw key and env entry to stdout,");
-                eprintln!("         one per line. For scripting (e.g. setup.sh).");
+                eprintln!("--hash <raw-key>  Re-hash an EXISTING raw key instead of minting a");
+                eprintln!("                  new one. Emits a fresh ONEIRO_API_KEYS entry that");
+                eprintln!("                  verifies the same key — for recovering a lost hash");
+                eprintln!("                  without rotating the live key.");
+                eprintln!("--quiet           Emit only the raw key and env entry to stdout,");
+                eprintln!("                  one per line. For scripting (e.g. setup.sh).");
                 return Ok(());
             }
             other => {
@@ -1222,8 +1234,30 @@ fn run_keygen(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let role = role.ok_or("--role is required (e.g. --role rover)")?;
-    let key = api_key::generate_api_key(role)?;
-    if quiet {
+
+    let (key, rehashed) = match hash_existing {
+        Some(raw) => (api_key::hash_existing_key(&raw, role)?, true),
+        None => (api_key::generate_api_key(role)?, false),
+    };
+
+    if rehashed {
+        if quiet {
+            println!("{}", key.env_entry());
+        } else {
+            eprintln!();
+            eprintln!("═══ ONEIRO_API_KEYS ENTRY (re-hash of existing key) ═══");
+            eprintln!();
+            eprintln!("  Role:    {}", key.role.as_str());
+            eprintln!("  Key ID:  {}", key.key_id);
+            eprintln!();
+            eprintln!("  Add/keep this in ONEIRO_API_KEYS (semicolon-separated):");
+            eprintln!();
+            eprintln!("    {}", key.env_entry());
+            eprintln!();
+            eprintln!("  (Your raw key is unchanged — nothing on the device needs updating.)");
+            eprintln!();
+        }
+    } else if quiet {
         api_key::print_generated_key_quiet(&key);
     } else {
         api_key::print_generated_key(&key);

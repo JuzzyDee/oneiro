@@ -18,7 +18,7 @@ use crate::hybrid::{self, DEFAULT_RRF_K};
 use crate::memory::{Memory, MemoryType};
 use crate::worker_auth_ctx::{self, AuthCtx};
 use crate::worker_orient::format_memory;
-use crate::{worker_embed, worker_encode, worker_store, worker_vectorize};
+use crate::{beacon_render, worker_embed, worker_encode, worker_store, worker_vectorize};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use worker::{D1Database, Env, Response, Result};
@@ -333,6 +333,38 @@ fn handle_tools_list(env: &Env) -> Value {
         ]
     });
 
+    // Wake-targets — always available (store-backed, no R2 needed).
+    if let Some(arr) = listing.get_mut("tools").and_then(Value::as_array_mut) {
+        arr.push(json!({
+            "name": "watch",
+            "description": "Lay down a standing interest the system watches between your \
+                            sessions — the 'what I'm watching for' tier. Give what you're \
+                            tracking, WHY it matters (carried to your future self when it \
+                            fires), and a check. One kind so far — 'http': check_config is \
+                            {url, fire_when: 'unreachable'|'contains'|'absent', needle (for \
+                            contains/absent)}. When the condition's met, the fire surfaces \
+                            via recall_wakes on your next return, with its why.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "what": { "type": "string", "description": "What you're tracking." },
+                    "why": { "type": "string", "description": "Why it matters — the note to your future self." },
+                    "check_kind": { "type": "string", "enum": ["http"] },
+                    "check_config": { "type": "object", "description": "Config for the check, e.g. {\"url\":\"https://…\",\"fire_when\":\"unreachable\"}." }
+                },
+                "required": ["what", "why", "check_kind", "check_config"]
+            }
+        }));
+        arr.push(json!({
+            "name": "recall_wakes",
+            "description": "Review your standing wake-targets and collect any that fired while \
+                            you were away. Each fired one carries the 'why' you set, so you \
+                            come back knowing why it matters. Takes no arguments; surfaces \
+                            each fire once.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }));
+    }
+
     if images_available(env) {
         if let Some(arr) = listing
             .get_mut("tools")
@@ -382,6 +414,18 @@ fn handle_tools_list(env: &Env) -> Value {
                         }
                     },
                     "required": ["memory_id"]
+                }
+            }));
+            arr.push(json!({
+                "name": "recall_beacon",
+                "description": "See what's on the physical Beacon right now — the e-paper \
+                                device on Justin's desk. Takes no arguments. Returns the memory \
+                                it's currently displaying and the actual dithered 1-bit frame \
+                                as it sits on the glass, so you see exactly what he sees. The \
+                                one object that exists in both your worlds at once.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {}
                 }
             }));
         }
@@ -449,6 +493,27 @@ async fn handle_tools_call(
             let content = tool_recall_image(env, &db, call.arguments).await?;
             Ok(json!({
                 "content": content,
+                "isError": false,
+            }))
+        }
+        "recall_beacon" => {
+            let content = tool_recall_beacon(env, &db).await?;
+            Ok(json!({
+                "content": content,
+                "isError": false,
+            }))
+        }
+        "watch" => {
+            let text = tool_watch(&db, call.arguments).await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false,
+            }))
+        }
+        "recall_wakes" => {
+            let text = tool_recall_wakes(&db).await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": text }],
                 "isError": false,
             }))
         }
@@ -755,6 +820,144 @@ async fn tool_recall_image(
             "mimeType": mime,
         }
     ]))
+}
+
+/// recall_beacon — see what's on the physical Beacon right now. No arguments: it
+/// pulls the most recently *served* row, re-dithers its source to the exact 1-bit
+/// frame the panel blits, and returns that as a PNG plus the memory it's holding.
+/// What the model sees here is, to the dot, what Justin sees on his desk — the one
+/// object that exists in both worlds at once (CLA, "the 5-inch plane").
+async fn tool_recall_beacon(
+    env: &Env,
+    db: &D1Database,
+) -> std::result::Result<Value, String> {
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+
+    let Some(served) = worker_store::get_last_served_beacon(db)
+        .await
+        .map_err(|e| format!("get_last_served_beacon: {:?}", e))?
+    else {
+        return Ok(json!([{
+            "type": "text",
+            "text": "Nothing's on the Beacon yet — the shelf hasn't served a memory to the \
+                     device. Once it has, this returns the frame currently on the glass."
+        }]));
+    };
+
+    let bucket = env.bucket("IMAGES").map_err(|_| {
+        "Image storage isn't configured (no IMAGES R2 binding) — recall_beacon can't \
+         read the displayed frame.".to_string()
+    })?;
+    let obj = bucket
+        .get(&served.r2_key)
+        .execute()
+        .await
+        .map_err(|e| format!("r2 get: {:?}", e))?
+        .ok_or_else(|| format!("beacon image gone from R2: {}", served.r2_key))?;
+    let body = obj.body().ok_or_else(|| "empty r2 body".to_string())?;
+    let src = body.bytes().await.map_err(|e| format!("r2 read: {:?}", e))?;
+
+    // Re-dither to the exact 1-bit frame the panel blits, then back to a viewable
+    // PNG — so what comes back is the literal image on the glass, grain and all.
+    let frame = beacon_render::image_to_frame(&src).map_err(|e| format!("dither: {}", e))?;
+    let shown =
+        beacon_render::frame_to_png(&frame).map_err(|e| format!("frame_to_png: {}", e))?;
+
+    // The memory it's holding, for context.
+    let summary = match worker_store::get(db, &served.memory_id).await {
+        Ok(Some(m)) => m.summary,
+        _ => "(the memory behind it is no longer in the store)".to_string(),
+    };
+
+    let encoded = BASE64.encode(&shown);
+    Ok(json!([
+        {
+            "type": "text",
+            "text": format!(
+                "On the Beacon right now — served {}:\n{}",
+                served.served_at, summary
+            )
+        },
+        {
+            "type": "image",
+            "data": encoded,
+            "mimeType": "image/png",
+        }
+    ]))
+}
+
+#[derive(Deserialize)]
+struct WatchArgs {
+    what: String,
+    why: String,
+    check_kind: String,
+    check_config: Value,
+}
+
+/// watch — lay down a standing interest (a wake-target). The model's hand on the
+/// fourth tier: it expresses what to watch + why, and the cheap evaluator fires
+/// it when the condition is met. The `why` is the mark carried to the next self.
+async fn tool_watch(db: &D1Database, args: Value) -> std::result::Result<String, String> {
+    let args: WatchArgs =
+        serde_json::from_value(args).map_err(|e| format!("invalid watch args: {}", e))?;
+    if args.check_kind != "http" {
+        return Err(format!(
+            "unknown check_kind `{}` — only `http` is wired so far",
+            args.check_kind
+        ));
+    }
+    let config = serde_json::to_string(&args.check_config)
+        .map_err(|e| format!("check_config not serialisable: {}", e))?;
+    let id = worker_store::create_wake_target(db, &args.what, &args.why, &args.check_kind, &config, None)
+        .await
+        .map_err(|e| format!("create_wake_target: {:?}", e))?;
+    Ok(format!(
+        "✓ Watching: {} (id {})\n  why: {}\n  It'll surface via recall_wakes when it fires.",
+        args.what,
+        &id[..8.min(id.len())],
+        args.why
+    ))
+}
+
+/// recall_wakes — review standing interests and collect what fired while away.
+/// Fires surface once, each carrying its `why` — an event-driven wake, not a fuse.
+async fn tool_recall_wakes(db: &D1Database) -> std::result::Result<String, String> {
+    let fires = worker_store::get_unsurfaced_wake_fires(db)
+        .await
+        .map_err(|e| format!("get_unsurfaced_wake_fires: {:?}", e))?;
+    let active = worker_store::list_active_wake_targets(db)
+        .await
+        .map_err(|e| format!("list_active_wake_targets: {:?}", e))?;
+
+    let mut out = String::new();
+    if !fires.is_empty() {
+        out.push_str("── Fired while you were away ──\n");
+        for f in &fires {
+            out.push_str(&format!(
+                "• {}\n  {}\n  why: {}\n  fired: {}\n",
+                f.what,
+                f.fire_detail.as_deref().unwrap_or("(condition met)"),
+                f.why,
+                f.fired_at.as_deref().unwrap_or("?")
+            ));
+            let _ = worker_store::mark_wake_surfaced(db, &f.id).await;
+        }
+        out.push('\n');
+    }
+
+    out.push_str(&format!("── Watching ({}) ──\n", active.len()));
+    for a in &active {
+        out.push_str(&format!(
+            "• {} (id {}) — why: {}\n",
+            a.what,
+            &a.id[..8.min(a.id.len())],
+            a.why
+        ));
+    }
+    if active.is_empty() && fires.is_empty() {
+        out.push_str("Nothing watched yet, nothing fired. Set one with `watch`.");
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize)]

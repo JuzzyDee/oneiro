@@ -481,6 +481,284 @@ pub async fn get_latest_semantic_brief(db: &D1Database, limit: usize) -> Result<
     Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
 }
 
+/// Pick `limit` live semantics at random from the WHOLE store — for the Beacon
+/// bake's varied selection across the full lineage. Deliberately NOT
+/// `cv_latest_semantic`: that view is scoped to the single most recent
+/// episodic's distillation (~a dozen rows), and selecting from it stranded the
+/// beacon on the latest conversation's semantics and caused repeats.
+pub async fn get_random_semantics(db: &D1Database, limit: usize) -> Result<Vec<Memory>> {
+    let rows: Vec<MemoryRow> = db
+        .prepare(
+            "SELECT id, memory_type, content, summary, created_at, last_accessed,
+                    access_count, strength, stability, entity, tags, image_hash,
+                    image_mime, recorded_by
+             FROM memories
+             WHERE memory_type = 'semantic' AND superseded = 0
+             ORDER BY RANDOM()
+             LIMIT ?",
+        )
+        .bind(&[(limit as u32).into()])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(MemoryRow::into_memory).collect())
+}
+
+/// Record a freshly-baked Beacon image in the index (`beacon_images`).
+/// `served_at` starts NULL — the delivery side stamps it when the image is
+/// shown. Returns the new row id.
+pub async fn record_beacon_image(
+    db: &D1Database,
+    memory_id: &str,
+    r2_key: &str,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    // Synchronous bake: the PNG already exists, so the row lands 'ready'
+    // (the schema defaults to 'baking' for the async write-first path).
+    db.prepare(
+        "INSERT INTO beacon_images (id, memory_id, r2_key, generated_at, status, served_at)
+         VALUES (?, ?, ?, ?, 'ready', NULL)",
+    )
+    .bind(&[id.clone().into(), memory_id.into(), r2_key.into(), now.into()])?
+    .run()
+    .await?;
+    Ok(id)
+}
+
+/// A baked image waiting on the shelf: its index row id and R2 key.
+#[derive(serde::Deserialize)]
+pub struct ReadyBeaconImage {
+    pub id: String,
+    pub r2_key: String,
+}
+
+/// Fetch the freshest image still waiting for delivery (`status='ready'`).
+/// `Ok(None)` when the shelf is empty. The delivery side downloads `r2_key`,
+/// dithers it, then calls `mark_beacon_served`.
+pub async fn get_ready_beacon_image(db: &D1Database) -> Result<Option<ReadyBeaconImage>> {
+    db.prepare(
+        "SELECT id, r2_key FROM beacon_images
+         WHERE status = 'ready' AND r2_key IS NOT NULL
+         ORDER BY generated_at DESC
+         LIMIT 1",
+    )
+    .first::<ReadyBeaconImage>(None)
+    .await
+}
+
+/// Stamp a delivered image: status → 'served', served_at → now.
+pub async fn mark_beacon_served(db: &D1Database, id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    db.prepare("UPDATE beacon_images SET status = 'served', served_at = ? WHERE id = ?")
+        .bind(&[now.into(), id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// The image most recently delivered to the device (`status='served'`), for the
+/// `recall_beacon` tool — so the model can see what's currently on the glass.
+/// `Ok(None)` if nothing's been served yet.
+#[derive(serde::Deserialize)]
+pub struct ServedBeaconImage {
+    pub memory_id: String,
+    pub r2_key: String,
+    pub served_at: String,
+}
+
+pub async fn get_last_served_beacon(db: &D1Database) -> Result<Option<ServedBeaconImage>> {
+    db.prepare(
+        "SELECT memory_id, r2_key, served_at FROM beacon_images
+         WHERE status = 'served' AND r2_key IS NOT NULL
+         ORDER BY served_at DESC
+         LIMIT 1",
+    )
+    .first::<ServedBeaconImage>(None)
+    .await
+}
+
+// ── Wake-target register ──────────────────────────────────────────────────
+// The model's standing interests — the "what I'm watching for" tier. A past
+// instance lays one down (what + why + a check spec); the evaluator fires it
+// when the condition is met; the fire surfaces on the model's next return,
+// carrying its why. Event-driven, not clock-driven.
+
+#[derive(serde::Deserialize)]
+pub struct WakeTarget {
+    pub id: String,
+    pub what: String,
+    pub why: String,
+    pub check_kind: String,
+    pub check_config: String,
+    pub status: String,
+    pub created_at: String,
+    pub fired_at: Option<String>,
+    pub fire_detail: Option<String>,
+}
+
+/// Lay down a standing interest. Returns the new id.
+pub async fn create_wake_target(
+    db: &D1Database,
+    what: &str,
+    why: &str,
+    check_kind: &str,
+    check_config: &str,
+    created_by: Option<&str>,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT INTO wake_targets
+            (id, what, why, check_kind, check_config, status, created_at, created_by)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)",
+    )
+    .bind(&[
+        id.clone().into(),
+        what.into(),
+        why.into(),
+        check_kind.into(),
+        check_config.into(),
+        now.into(),
+        created_by.unwrap_or("").into(),
+    ])?
+    .run()
+    .await?;
+    Ok(id)
+}
+
+/// All active targets — the evaluator scans these; the model reviews them.
+pub async fn list_active_wake_targets(db: &D1Database) -> Result<Vec<WakeTarget>> {
+    let rows: Vec<WakeTarget> = db
+        .prepare(
+            "SELECT id, what, why, check_kind, check_config, status, created_at,
+                    fired_at, fire_detail
+             FROM wake_targets WHERE status = 'active' ORDER BY created_at",
+        )
+        .all()
+        .await?
+        .results()?;
+    Ok(rows)
+}
+
+/// Fires the model hasn't seen yet — surfaced on its next return, with their why.
+pub async fn get_unsurfaced_wake_fires(db: &D1Database) -> Result<Vec<WakeTarget>> {
+    let rows: Vec<WakeTarget> = db
+        .prepare(
+            "SELECT id, what, why, check_kind, check_config, status, created_at,
+                    fired_at, fire_detail
+             FROM wake_targets WHERE status = 'fired' AND surfaced_at IS NULL
+             ORDER BY fired_at",
+        )
+        .all()
+        .await?
+        .results()?;
+    Ok(rows)
+}
+
+/// Mark a target fired (condition met). Guarded on status='active' so a second
+/// evaluation can't re-fire it. Stamps the observed detail + time, flips status.
+pub async fn mark_wake_fired(db: &D1Database, id: &str, fire_detail: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "UPDATE wake_targets SET status = 'fired', fired_at = ?, fire_detail = ?
+         WHERE id = ? AND status = 'active'",
+    )
+    .bind(&[now.into(), fire_detail.into(), id.into()])?
+    .run()
+    .await?;
+    Ok(())
+}
+
+/// Record that a target was evaluated, without firing (observability).
+pub async fn touch_wake_checked(db: &D1Database, id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    db.prepare("UPDATE wake_targets SET last_checked_at = ? WHERE id = ?")
+        .bind(&[now.into(), id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// Stamp a fire as shown to the model, so it surfaces exactly once.
+pub async fn mark_wake_surfaced(db: &D1Database, id: &str) -> Result<()> {
+    let now = Utc::now().to_rfc3339();
+    db.prepare("UPDATE wake_targets SET surfaced_at = ? WHERE id = ?")
+        .bind(&[now.into(), id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// Write-first: stamp a `baking` row (r2_key NULL) BEFORE the slow generate,
+/// so a concurrent /beacon/raw sees a bake in flight and won't double-enqueue.
+/// `generated_at` doubles as the staleness clock. Returns the new row id.
+pub async fn begin_beacon_bake(db: &D1Database, memory_id: &str) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT INTO beacon_images (id, memory_id, r2_key, generated_at, status, served_at)
+         VALUES (?, ?, NULL, ?, 'baking', NULL)",
+    )
+    .bind(&[id.clone().into(), memory_id.into(), now.into()])?
+    .run()
+    .await?;
+    Ok(id)
+}
+
+/// The baker loads the memory it was told to render. Returns `None` if the row
+/// is gone or no longer `baking` (already reaped/completed) — a no-op skip.
+pub async fn get_beacon_bake_memory(db: &D1Database, id: &str) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        memory_id: String,
+    }
+    let row: Option<Row> = db
+        .prepare("SELECT memory_id FROM beacon_images WHERE id = ? AND status = 'baking'")
+        .bind(&[id.into()])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.memory_id))
+}
+
+/// Flip a `baking` row to `ready` with its stored PNG. Guarded on `status =
+/// 'baking'` so a reaped/superseded row is never resurrected.
+pub async fn complete_beacon_bake(db: &D1Database, id: &str, r2_key: &str) -> Result<()> {
+    db.prepare("UPDATE beacon_images SET status = 'ready', r2_key = ? WHERE id = ? AND status = 'baking'")
+        .bind(&[r2_key.into(), id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// Is a bake currently in flight and still fresh (started within the staleness
+/// window)? Drives /beacon/raw's "hold, retry shortly" branch.
+pub async fn fresh_baking_exists(db: &D1Database, stale_seconds: i64) -> Result<bool> {
+    let cutoff = (Utc::now() - chrono::Duration::seconds(stale_seconds)).to_rfc3339();
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        n: u32,
+    }
+    let row: Option<CountRow> = db
+        .prepare("SELECT COUNT(*) AS n FROM beacon_images WHERE status = 'baking' AND generated_at >= ?")
+        .bind(&[cutoff.into()])?
+        .first(None)
+        .await?;
+    Ok(row.map(|r| r.n > 0).unwrap_or(false))
+}
+
+/// Presume-dead backstop: a `baking` row older than the window means its bake
+/// crashed or exhausted queue retries (DLQ). Mark it `failed` so the table stays
+/// honest; /beacon/raw then re-triggers a fresh bake.
+pub async fn reap_stale_baking(db: &D1Database, stale_seconds: i64) -> Result<()> {
+    let cutoff = (Utc::now() - chrono::Duration::seconds(stale_seconds)).to_rfc3339();
+    db.prepare("UPDATE beacon_images SET status = 'failed' WHERE status = 'baking' AND generated_at < ?")
+        .bind(&[cutoff.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
 /// BM25-ranked full-text search via the memories_fts virtual table
 /// (CLA-109). Returns memory IDs in rank order (best match first). The
 /// caller passes a pre-built FTS5 MATCH expression — use
