@@ -36,6 +36,12 @@ pub enum Role {
     /// nothing else. A leaked hook key cannot read the store
     /// (recall_specific/recall_check) or write arbitrary memories.
     Hook,
+    /// The Beacon — a battery e-paper desk device that wakes daily and
+    /// fetches one memory to display (GET /beacon). Allows nothing but the
+    /// `beacon` scope: a key pulled off the physical device can read that one
+    /// endpoint and nothing else. The narrowest surface of any role, because
+    /// the credential lives on a device anyone could pick up.
+    Beacon,
 }
 
 impl Role {
@@ -43,6 +49,7 @@ impl Role {
         match self {
             Role::Rover => "rover",
             Role::Hook => "hook",
+            Role::Beacon => "beacon",
         }
     }
 
@@ -50,6 +57,7 @@ impl Role {
         match s {
             "rover" => Some(Role::Rover),
             "hook" => Some(Role::Hook),
+            "beacon" => Some(Role::Beacon),
             _ => None,
         }
     }
@@ -86,6 +94,9 @@ impl Role {
             // arbitrary memories — minimal surface for a key that lives on
             // every machine an instance runs on.
             Role::Hook => matches!(tool, "recall_orient" | "encode"),
+            // Beacon: one read-only scope, nothing else. The key lives on a
+            // physical desk device; if it walks, it fetches one memory.
+            Role::Beacon => matches!(tool, "beacon"),
         }
     }
 }
@@ -244,6 +255,37 @@ pub fn generate_api_key(role: Role) -> Result<GeneratedKey, String> {
     // Key ID: SHA-256 prefix of the raw key. Stable across restarts, one-way,
     // useful for audit ("the key with ID ab12cd34 was used"). 8 hex chars =
     // 32 bits of namespace, plenty for personal-scale.
+    let digest = Sha256::digest(raw.as_bytes());
+    let key_id = hex::encode(&digest[..4]);
+
+    Ok(GeneratedKey {
+        role,
+        raw,
+        hash,
+        key_id,
+    })
+}
+
+/// Hash an *existing* raw key under the given role, producing an entry that
+/// verifies that exact key. For reconstructing an `ONEIRO_API_KEYS` entry when
+/// the hash was lost but the raw key is still in hand — recovering the secret
+/// without rotating the live key. A fresh random salt makes the hash string
+/// differ from any prior hash of the same key, but verification is identical,
+/// so a key already deployed on a device keeps working untouched.
+pub fn hash_existing_key(raw: &str, role: Role) -> Result<GeneratedKey, String> {
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return Err("empty key".to_string());
+    }
+
+    let salt_bytes: [u8; 16] = rand::random();
+    let salt = SaltString::encode_b64(&salt_bytes)
+        .map_err(|e| format!("salt generation failed: {}", e))?;
+    let hash = Argon2::default()
+        .hash_password(raw.as_bytes(), &salt)
+        .map_err(|e| format!("hash failed: {}", e))?
+        .to_string();
+
     let digest = Sha256::digest(raw.as_bytes());
     let key_id = hex::encode(&digest[..4]);
 

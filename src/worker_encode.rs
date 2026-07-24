@@ -1308,6 +1308,10 @@ pub enum QueueMessage {
     /// whole multi-call encode; each is retried independently.
     EncodeUnit { episodic_id: String, unit: AtomicUnit },
     PollBatch { batch_id: String, attempt: u32 },
+    /// Bake one Beacon image. `row_id` is a `beacon_images` row already written
+    /// `baking` (write-first, so a concurrent /beacon/raw sees it and won't
+    /// double-enqueue). The consumer loads it, generates, flips it `ready`.
+    BeaconBake { row_id: String },
 }
 
 /// Write a captured episodic to the store and return it. Create is the durable,

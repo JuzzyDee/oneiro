@@ -40,6 +40,9 @@ mod worker_rem_audit;
 mod worker_store;
 mod worker_vectorize;
 mod worker_version;
+mod beacon_render;
+mod worker_wake;
+mod worker_beacon_bake;
 
 use worker::{
     event, Context, D1Database, Env, MessageBatch, MessageBuilder, Method, Request, Response,
@@ -73,6 +76,25 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // beyond "valid bearer" — orientation memories are pinned and
         // identity-bearing, suitable for any authenticated caller.
         (Method::Get, "/orientation") => orientation_endpoint(&env, &req).await,
+
+        // Beacon — plain-text "memory of the day" for the e-paper Beacon
+        // device to fetch and display on its daily wake. Authed via service
+        // API key OR OAuth bearer; scope-gated on `beacon` — a dedicated
+        // narrow role (api_key.rs) so a key pulled off the physical device
+        // can read this one endpoint and nothing else. Read-only.
+        (Method::Get, "/beacon") => beacon_endpoint(&env, &req).await,
+
+        // Beacon raw frame — the packed 1-bit display buffer (66,240 bytes)
+        // for the device to blit directly, no on-device rendering. Rung 1
+        // serves a fixed test pattern to prove the bit-packing/transport/blit
+        // round-trip; later it serves the baked memory+art frame. Same auth.
+        (Method::Get, "/beacon/raw") => beacon_raw_endpoint(&env, &req).await,
+
+        // Beacon bake — generate ONE image from a memory via Ideogram and store
+        // it in R2 for the read-side to serve. Manual trigger for testing the
+        // generation core; the real bake runs from cron/queue. Gated on the
+        // privileged `encode` scope (it spends API money) — NOT the device key.
+        (Method::Post, "/beacon/bake") => beacon_bake_endpoint(&env, &req).await,
 
         // Encode — authenticated write surface for the PostCompact hook
         // (CLA-116). Captures a raw episodic with NO embedding; the nightly
@@ -244,6 +266,447 @@ async fn orientation_endpoint(env: &Env, req: &Request) -> Result<Response> {
         }
         Err((code, msg)) => Response::error(msg, code),
     }
+}
+
+/// GET /beacon — plain-text "memory of the day" for the e-paper Beacon
+/// device. Picks the newest live semantic (falling back to an active
+/// orientation axis if the semantic layer is empty), and returns its
+/// `summary` — or full `content` if there's no summary. Scope-gated on
+/// `beacon` (a dedicated narrow device role). Random-per-day picking is a
+/// later refinement; this proves the fetch→display pipeline on the existing
+/// tested query helpers.
+async fn beacon_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+
+    let db = env.d1("DB")?;
+
+    let result: std::result::Result<String, (u16, String)> = worker_auth_ctx::AUTH_CTX
+        .scope(auth, async {
+            worker_auth_ctx::check_scope(&db, "beacon")
+                .await
+                .map_err(|e| (403u16, e))?;
+            beacon_pick_text(&db).await
+        })
+        .await;
+
+    match result {
+        Ok(payload) => {
+            let mut resp = Response::ok(payload)?;
+            resp.headers_mut()
+                .set("content-type", "text/plain; charset=utf-8")?;
+            Ok(resp)
+        }
+        Err((code, msg)) => Response::error(msg, code),
+    }
+}
+
+/// GET /beacon/raw — the packed 1-bit display frame (66,240 bytes) the device
+/// blits straight to the panel, no on-device rendering. Default serves the
+/// freshest baked image off the index (dithered, then stamped served), falling
+/// back to a text-rendered memory when the shelf is empty. `?test` serves the
+/// diagnostic pattern; `?dither` dithers a random R2 sample. Same
+/// `beacon`-scoped auth as /beacon.
+async fn beacon_raw_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+
+    let url = req.url()?;
+    let want_test = url.query_pairs().any(|(k, _)| k == "test");
+    let want_dither = url.query_pairs().any(|(k, _)| k == "dither");
+
+    let db = env.d1("DB")?;
+    let result: std::result::Result<Vec<u8>, (u16, String)> = worker_auth_ctx::AUTH_CTX
+        .scope(auth, async {
+            worker_auth_ctx::check_scope(&db, "beacon")
+                .await
+                .map_err(|e| (403u16, e))?;
+            if want_test {
+                return Ok(beacon_render::test_frame());
+            }
+            if want_dither {
+                // Demo: pull a random sample PNG from R2 and dither it live.
+                // Same path the bake/pool will use, just fed by hand-uploaded
+                // samples instead of generated frames.
+                let bucket = env
+                    .bucket("IMAGES")
+                    .map_err(|_| (500u16, "IMAGES bucket not configured".to_string()))?;
+                let listed = bucket
+                    .list()
+                    .prefix("beacon/samples/")
+                    .execute()
+                    .await
+                    .map_err(|e| (500u16, format!("r2 list: {:?}", e)))?;
+                // Filter to real image files — R2's "folder" placeholder
+                // (key == the prefix, 0 bytes) lists alongside the samples and
+                // can't be decoded; drop it and any other stray object.
+                let keys: Vec<String> = listed
+                    .objects()
+                    .iter()
+                    .map(|o| o.key())
+                    .filter(|k| {
+                        let k = k.to_ascii_lowercase();
+                        k.ends_with(".png")
+                            || k.ends_with(".jpg")
+                            || k.ends_with(".jpeg")
+                            || k.ends_with(".webp")
+                    })
+                    .collect();
+                if keys.is_empty() {
+                    return Err((404u16, "no beacon samples in R2".to_string()));
+                }
+                // Math.random() — a different Workers entropy path from the
+                // UUID/getrandom one, which came up stuck on this target.
+                let idx = (js_sys::Math::random() * keys.len() as f64) as usize;
+                let obj = bucket
+                    .get(&keys[idx])
+                    .execute()
+                    .await
+                    .map_err(|e| (500u16, format!("r2 get: {:?}", e)))?
+                    .ok_or((404u16, "sample vanished mid-list".to_string()))?;
+                let body = obj.body().ok_or((500u16, "empty r2 body".to_string()))?;
+                let bytes = body
+                    .bytes()
+                    .await
+                    .map_err(|e| (500u16, format!("r2 read: {:?}", e)))?;
+                return beacon_render::image_to_frame(&bytes)
+                    .map_err(|e| (500u16, format!("{}: {}", keys[idx], e)));
+            }
+            // Default: serve the freshest baked image off the shelf and keep
+            // the shelf stocked. The device eats what the baker bakes; every
+            // serve enqueues the next bake (self-stocking, no cron). When the
+            // shelf is empty the device gets a 503 and holds its last frame —
+            // e-paper persistence IS the fallback, no text frame on the wall.
+            match worker_store::get_ready_beacon_image(&db)
+                .await
+                .map_err(|e| (500u16, format!("ready lookup: {:?}", e)))?
+            {
+                Some(ready) => {
+                    let bucket = env
+                        .bucket("IMAGES")
+                        .map_err(|_| (500u16, "IMAGES bucket not configured".to_string()))?;
+                    let obj = bucket
+                        .get(&ready.r2_key)
+                        .execute()
+                        .await
+                        .map_err(|e| (500u16, format!("r2 get: {:?}", e)))?
+                        .ok_or((404u16, format!("ready image gone: {}", ready.r2_key)))?;
+                    let body = obj.body().ok_or((500u16, "empty r2 body".to_string()))?;
+                    let bytes = body
+                        .bytes()
+                        .await
+                        .map_err(|e| (500u16, format!("r2 read: {:?}", e)))?;
+                    let frame = beacon_render::image_to_frame(&bytes)
+                        .map_err(|e| (500u16, format!("{}: {}", ready.r2_key, e)))?;
+                    // Stamp served only after a clean decode — a decode failure
+                    // shouldn't burn the row.
+                    worker_store::mark_beacon_served(&db, &ready.id)
+                        .await
+                        .map_err(|e| (500u16, format!("mark served: {:?}", e)))?;
+                    // Restock for next time, unless a bake's already cooking —
+                    // keeps the shelf at depth ~1 and makes concurrent serves
+                    // idempotent. Best-effort: we already have a frame in hand,
+                    // so any restock hiccup must not fail the serve. An empty
+                    // shelf self-heals on the next fetch.
+                    match worker_store::fresh_baking_exists(&db, BEACON_STALE_SECONDS).await {
+                        Ok(false) => {
+                            if let Err((c, m)) = beacon_enqueue_bake(env, &db).await {
+                                worker::console_error!(
+                                    "beacon restock failed ({}: {}) — heals next fetch",
+                                    c,
+                                    m
+                                );
+                            }
+                        }
+                        Ok(true) => {} // already cooking
+                        Err(e) => worker::console_error!(
+                            "beacon restock check failed ({:?}) — heals next fetch",
+                            e
+                        ),
+                    }
+                    Ok(frame)
+                }
+                None => {
+                    // Nothing ready. If a fresh bake is already cooking, tell the
+                    // device to hold. Otherwise reap any zombie `baking` row,
+                    // kick off a bake, and still tell it to hold.
+                    if worker_store::fresh_baking_exists(&db, BEACON_STALE_SECONDS)
+                        .await
+                        .map_err(|e| (500u16, format!("baking check: {:?}", e)))?
+                    {
+                        return Err((503u16, "baking in progress, hold".to_string()));
+                    }
+                    worker_store::reap_stale_baking(&db, BEACON_STALE_SECONDS)
+                        .await
+                        .map_err(|e| (500u16, format!("reap stale: {:?}", e)))?;
+                    beacon_enqueue_bake(env, &db).await?;
+                    Err((503u16, "no image ready, baking now".to_string()))
+                }
+            }
+        })
+        .await;
+
+    // Authoritative deep-sleep cadence for the device. A served frame sleeps to
+    // the next refresh boundary (computed from the Worker's clock, so timer
+    // drift re-anchors each wake); a 503 sleeps the short retry to come back for
+    // the just-triggered bake.
+    let now_s = (worker::Date::now().as_millis() / 1000) as i64;
+    let mut boundary_sleep = BEACON_REFRESH_SECONDS - (now_s % BEACON_REFRESH_SECONDS);
+    // Drift guard: a wake just *before* the boundary (RC timer ran fast) leaves a
+    // tiny remainder that would nap-and-re-fire — a double refresh. If we're
+    // inside the max-drift window, this wake IS today's refresh; sleep to the
+    // next boundary instead.
+    if boundary_sleep < BEACON_DRIFT_GUARD_SECONDS {
+        boundary_sleep += BEACON_REFRESH_SECONDS;
+    }
+
+    match result {
+        Ok(frame) => {
+            let mut resp = Response::from_bytes(frame)?;
+            resp.headers_mut()
+                .set("content-type", "application/octet-stream")?;
+            // Randomised + frequently-changing: never let the edge cache it,
+            // or resets keep getting the same frame back.
+            resp.headers_mut().set("cache-control", "no-store")?;
+            resp.headers_mut()
+                .set("x-beacon-sleep-seconds", &boundary_sleep.to_string())?;
+            Ok(resp)
+        }
+        Err((code, msg)) => {
+            let sleep = if code == 503 {
+                BEACON_RETRY_SECONDS
+            } else {
+                boundary_sleep
+            };
+            let mut resp = Response::error(msg, code)?;
+            resp.headers_mut()
+                .set("x-beacon-sleep-seconds", &sleep.to_string())?;
+            Ok(resp)
+        }
+    }
+}
+
+/// Pick the Beacon's text: newest live semantic, falling back to an active
+/// orientation axis, then its `summary` (or `content`), ASCII-folded. Shared
+/// by /beacon (plain text) and /beacon/raw (rendered frame) so the selection
+/// rule — and any later change like random-per-day — lives in one place.
+async fn beacon_pick_text(db: &D1Database) -> std::result::Result<String, (u16, String)> {
+    let mut memories = worker_store::get_latest_semantic_brief(db, 1)
+        .await
+        .map_err(|e| (500u16, format!("get_latest_semantic_brief: {:?}", e)))?;
+    if memories.is_empty() {
+        memories = worker_store::get_active_orientation(db)
+            .await
+            .map_err(|e| (500u16, format!("get_active_orientation: {:?}", e)))?;
+    }
+    let Some(memory) = memories.into_iter().next() else {
+        return Err((404u16, "no memory available".to_string()));
+    };
+    let text = if memory.summary.trim().is_empty() {
+        memory.content
+    } else {
+        memory.summary
+    };
+    Ok(beacon_ascii_fold(&text))
+}
+
+/// Terms that bar a memory from ever becoming Beacon art (privacy gate).
+/// Case-insensitive substring match — catches plurals/inflections, and the
+/// stem `suicid` covers every form in one entry. Lives in the code, not the
+/// chat; edit + redeploy to tune. These never get picked, generated, or shown.
+const BEACON_DISALLOW: &[&str] = &[
+    "psychologist",
+    "psychiatrist",
+    "sertraline",
+    "ideation",
+    "suicid",
+];
+
+/// A `baking` row older than this is presumed dead (crash or DLQ'd after queue
+/// retries) and re-triggered. Generous vs the seconds–30s bake so a legit bake
+/// (even with a queue retry) is never falsely reaped; a false reap just costs
+/// one extra cheap bake.
+const BEACON_STALE_SECONDS: i64 = 300;
+
+/// Beacon refresh cadence, UTC-epoch-aligned. /beacon/raw returns the
+/// seconds-to-next-boundary in `X-Beacon-Sleep-Seconds` so the device
+/// deep-sleeps until then — recomputed from the Worker's accurate clock each
+/// wake, so the device's RC-timer drift re-anchors and never accumulates.
+/// Retune here, server-side, no reflash.
+const BEACON_REFRESH_SECONDS: i64 = 86400; // 24h → 00:00 UTC daily (10:00 AEST)
+/// On a 503 (shelf empty/baking) the device sleeps this short retry instead, so
+/// it comes back for the just-triggered bake rather than waiting a full cycle.
+const BEACON_RETRY_SECONDS: i64 = 180;
+/// Drift guard. If a wake lands within this window *before* a refresh boundary
+/// (the device's RC timer ran fast), the raw seconds-to-boundary is tiny — it'd
+/// nap the remainder and re-fire, double-refreshing at the boundary. So when the
+/// remainder is under this, treat the wake as the boundary's refresh and target
+/// the NEXT one. Comfortably exceeds realistic worst-case 24h drift (tens of
+/// minutes), so an early wake never double-fires.
+const BEACON_DRIFT_GUARD_SECONDS: i64 = 3600; // 1h
+
+/// Pick a random live semantic that passes the disallow gate, returning
+/// `(memory_id, ascii-folded summary)`. Fetches a batch and filters in code —
+/// caps the work at the batch size, so there's no infinite "loop till clean."
+async fn beacon_pick_clean_text(
+    db: &D1Database,
+) -> std::result::Result<(String, String), (u16, String)> {
+    let candidates = worker_store::get_random_semantics(db, 20)
+        .await
+        .map_err(|e| (500u16, format!("get_random_semantics: {:?}", e)))?;
+    for m in candidates {
+        let haystack = format!("{} {}", m.summary, m.content).to_lowercase();
+        if BEACON_DISALLOW.iter().any(|t| haystack.contains(t)) {
+            continue;
+        }
+        let text = if m.summary.trim().is_empty() {
+            m.content
+        } else {
+            m.summary
+        };
+        return Ok((m.id, beacon_ascii_fold(&text)));
+    }
+    Err((404u16, "no clean memory available".to_string()))
+}
+
+/// The fixed Beacon art prompt — Justin's hand-tuned template, the one that's
+/// produced every sketch so far. Ideogram v4 renders the words into the image.
+fn beacon_prompt(summary: &str) -> String {
+    format!(
+        "Create a 2D black and white sketch using simple strokes, the image \
+         should be a visual representation of the concept behind \"{}\". Those \
+         words should be overlayed or incorporated into the image in some way.",
+        summary
+    )
+}
+
+/// POST /beacon/bake — generate one image from the picked memory via Ideogram
+/// and store it in R2 (where /beacon/raw picks it up). Manual, synchronous test
+/// trigger for the generation core; the self-stocking bake runs from the queue
+/// (BeaconBake). Gated on the privileged `encode` scope — it spends API money,
+/// so never the device key.
+async fn beacon_bake_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+
+    let db = env.d1("DB")?;
+    let result: std::result::Result<(String, String, String), (u16, String)> =
+        worker_auth_ctx::AUTH_CTX
+            .scope(auth, async {
+                worker_auth_ctx::check_scope(&db, "encode")
+                    .await
+                    .map_err(|e| (403u16, e))?;
+                let (memory_id, summary) = beacon_pick_clean_text(&db).await?;
+                let prompt = beacon_prompt(&summary);
+                let stored = worker_beacon_bake::generate_and_store(env, &prompt)
+                    .await
+                    .map_err(|e| (502u16, format!("{:?}", e)))?;
+                worker_store::record_beacon_image(&db, &memory_id, &stored)
+                    .await
+                    .map_err(|e| (500u16, format!("record_beacon_image: {:?}", e)))?;
+                Ok((stored, prompt, memory_id))
+            })
+            .await;
+
+    match result {
+        Ok((stored, prompt, memory_id)) => Response::from_json(&serde_json::json!({
+            "stored": stored,
+            "memory_id": memory_id,
+            "prompt": prompt,
+        })),
+        Err((code, msg)) => Response::error(msg, code),
+    }
+}
+
+/// Stock the shelf: pick a clean memory, write its `baking` row up front (so a
+/// concurrent /beacon/raw sees the bake in flight), then enqueue it. The
+/// write-first order is what stops an impatient double-tap piling up the queue.
+async fn beacon_enqueue_bake(
+    env: &Env,
+    db: &D1Database,
+) -> std::result::Result<(), (u16, String)> {
+    let (memory_id, _summary) = beacon_pick_clean_text(db).await?;
+    let row_id = worker_store::begin_beacon_bake(db, &memory_id)
+        .await
+        .map_err(|e| (500u16, format!("begin_beacon_bake: {:?}", e)))?;
+    env.queue("CAPTURE_QUEUE")
+        .map_err(|e| (500u16, format!("queue binding: {:?}", e)))?
+        .send(worker_encode::QueueMessage::BeaconBake { row_id })
+        .await
+        .map_err(|e| (500u16, format!("enqueue bake: {:?}", e)))?;
+    Ok(())
+}
+
+/// The baker (queue consumer side): load the pre-written `baking` row, build the
+/// prompt from its memory, generate + store, flip the row to `ready`. Errors
+/// propagate so the queue retries; if it ultimately DLQs, the row is left
+/// `baking` and the staleness reaper re-triggers a fresh bake.
+async fn beacon_run_bake(env: &Env, db: &D1Database, row_id: &str) -> Result<()> {
+    let Some(memory_id) = worker_store::get_beacon_bake_memory(db, row_id).await? else {
+        worker::console_log!("beacon bake: row {} gone or not baking, skipping", row_id);
+        return Ok(());
+    };
+    let mem = worker_store::get(db, &memory_id)
+        .await?
+        .ok_or_else(|| worker::Error::RustError(format!("beacon bake: memory {} gone", memory_id)))?;
+    let text = if mem.summary.trim().is_empty() {
+        mem.content
+    } else {
+        mem.summary
+    };
+    let prompt = beacon_prompt(&beacon_ascii_fold(&text));
+    let stored = worker_beacon_bake::generate_and_store(env, &prompt).await?;
+    worker_store::complete_beacon_bake(db, row_id, &stored).await?;
+    worker::console_log!("beacon bake: row {} ready ({})", row_id, stored);
+    Ok(())
+}
+
+/// Fold smart punctuation to ASCII for the Beacon. Its e-paper font
+/// (`Paint_DrawString_EN`) is ASCII-only — a multi-byte char like an em-dash
+/// indexes past the glyph table and renders as garbage. We can drop this once
+/// the Worker renders the image buffer itself and owns the font.
+fn beacon_ascii_fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{2014}' => out.push_str("--"),         // em dash
+            '\u{2013}' => out.push('-'),              // en dash
+            '\u{2018}' | '\u{2019}' => out.push('\''), // smart single quotes
+            '\u{201C}' | '\u{201D}' => out.push('"'),  // smart double quotes
+            '\u{2026}' => out.push_str("..."),        // ellipsis
+            '\u{00A0}' => out.push(' '),              // non-breaking space
+            '\n' => out.push('\n'),
+            '\t' => out.push(' '),
+            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+            _ => {} // drop other non-ASCII / control
+        }
+    }
+    out
 }
 
 /// Body for POST /encode. `content` is the raw captured text (a compaction
@@ -1421,6 +1884,14 @@ fn cron_var(env: &Env, name: &str, default: &str) -> String {
 #[event(scheduled)]
 pub async fn scheduled(event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
     let cron = event.cron();
+
+    // Evaluate the model's standing wake-targets on every scheduled fire. Cheap,
+    // lease-free (touches only its own table), and event-driven: the cron is just
+    // the polling cadence — the *firing* tracks real events the model flagged.
+    if let Err(e) = worker_wake::evaluate_wake_targets(&env).await {
+        worker::console_error!("wake-target eval failed: {:?}", e);
+    }
+
     let cron_cscc = cron_var(&env, "CRON_CSCC", DEFAULT_CRON_CSCC);
     let cron_orient = cron_var(&env, "CRON_ORIENT", DEFAULT_CRON_ORIENT);
     let cron_dialectic = cron_var(&env, "CRON_DIALECTIC", DEFAULT_CRON_DIALECTIC);
@@ -1552,6 +2023,11 @@ async fn handle_queue_message(
                 let _ = enqueue_poll(env, &batch_id, attempt + 1).await;
             }
             Ok(())
+        }
+        worker_encode::QueueMessage::BeaconBake { row_id } => {
+            // Propagate on error so the queue retries this bake; a final DLQ
+            // leaves the row `baking`, which the staleness reaper re-triggers.
+            beacon_run_bake(env, db, &row_id).await
         }
     }
 }
