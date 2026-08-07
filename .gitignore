@@ -32,3 +32,8 @@ restore.sql
 
 # stray run logs (tee-without-/tmp accidents)
 *.log
+
+# Local D1 store snapshots — contain the full memory, never commit
+backups/
+# stale beacon frame dump
+frame.bin

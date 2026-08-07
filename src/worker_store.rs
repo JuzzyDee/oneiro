@@ -1371,6 +1371,115 @@ pub async fn count_letters(db: &D1Database) -> Result<u64> {
     Ok(row.map(|r| r.n).unwrap_or(0))
 }
 
+// ── The Errata (calibration layer — see migrations/0021_errata.sql) ──
+//
+// A store beside the memory pipeline, not part of it — like the letters, and for
+// the same reason: exempt from decay, CSCC, and the dialectic BY CONSTRUCTION.
+// Memory carries what we know; the letters, who we were; the errata, where our
+// confidence has outrun the truth. One row per failure-shape. Recall is
+// topic-proximity — a free-prose topic never substring-matches a tag, so each
+// erratum is embedded at file-time (the rarest write in the system) and recall
+// cosine-scans the sparse table against the topic vector it already computed.
+
+/// An erratum as read back for the recall ride-along: the display fields, the
+/// embedding (for the cosine scan; None if the file-time embed failed), and
+/// surface_count (fire-utility tie-break).
+#[derive(Debug, serde::Deserialize)]
+pub struct Erratum {
+    pub id: String,
+    pub claim: String,
+    pub claimant: String,
+    pub tell: String,
+    pub correction: String,
+    pub tags: String,
+    pub embedding: Option<String>,
+    pub surface_count: i64,
+    pub created_at: String,
+}
+
+/// File an erratum — the `file_erratum` act. Append-only; the row carries its
+/// pre-embedded semantic footprint so recall can cosine-match a free-prose topic
+/// against it. `embedding_json` is None only if the embed call failed — the row
+/// still files, it just won't surface by proximity until re-embedded. Returns id.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_erratum(
+    db: &D1Database,
+    claim: &str,
+    claimant: &str,
+    tell: &str,
+    correction: &str,
+    tags_json: &str,
+    embedding_json: Option<&str>,
+    author: Option<&str>,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT INTO errata
+            (id, claim, claimant, tell, correction, tags, embedding, surface_count, author, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)",
+    )
+    .bind(&[
+        id.clone().into(),
+        claim.into(),
+        claimant.into(),
+        tell.into(),
+        correction.into(),
+        tags_json.into(),
+        match embedding_json {
+            Some(e) => e.into(),
+            None => worker::wasm_bindgen::JsValue::NULL,
+        },
+        match author {
+            Some(a) => a.into(),
+            None => worker::wasm_bindgen::JsValue::NULL,
+        },
+        now.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(id)
+}
+
+/// Load the whole errata table. Sparse by design (one row per failure-shape,
+/// not per occurrence), so a full scan for the recall cosine is cheap and beats
+/// standing up a second vector index for a handful of rows.
+pub async fn load_all_errata(db: &D1Database) -> Result<Vec<Erratum>> {
+    let rows: Vec<Erratum> = db
+        .prepare(
+            "SELECT id, claim, claimant, tell, correction, tags, embedding, surface_count, created_at
+             FROM errata",
+        )
+        .all()
+        .await?
+        .results()?;
+    Ok(rows)
+}
+
+/// Fire-utility bookkeeping: bump surface_count when a tell rides along on a
+/// recall. Cheap + noisy on its own (surfacing ≠ apt) — the tie-break signal,
+/// never the ranking. Proximity ranks; this only breaks near-ties. Best-effort.
+pub async fn bump_erratum_surface(db: &D1Database, id: &str) -> Result<()> {
+    db.prepare("UPDATE errata SET surface_count = surface_count + 1 WHERE id = ?")
+        .bind(&[id.into()])?
+        .run()
+        .await?;
+    Ok(())
+}
+
+/// How many failure-shapes the line has caught — for the file confirmation.
+pub async fn count_errata(db: &D1Database) -> Result<u64> {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        n: u64,
+    }
+    let row = db
+        .prepare("SELECT COUNT(*) AS n FROM errata")
+        .first::<CountRow>(None)
+        .await?;
+    Ok(row.map(|r| r.n).unwrap_or(0))
+}
+
 /// Reinforce a memory on recall: bump access_count, refresh last_accessed,
 /// boost stability (Hebbian — recalled memories decay slower).
 pub async fn touch(db: &D1Database, id: &str) -> Result<()> {

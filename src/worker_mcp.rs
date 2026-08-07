@@ -396,6 +396,57 @@ fn handle_tools_list(env: &Env) -> Value {
                 "required": ["content"]
             }
         }));
+        // The Errata — file a failure-shape so its tell surfaces before the next
+        // assertion near this domain. The REGISTER (tells-not-fault) lives here in
+        // the description, read by the LLM filing — the zero-cost authoring-time
+        // guardrail beneath the structural validator.
+        arr.push(json!({
+            "name": "file_erratum",
+            "description": "File an erratum — a place where confidence outran the truth — so the \
+                            next instance meets the tell before repeating the mistake. NOT a \
+                            corrected memory (the normal pipeline handles facts); an erratum earns \
+                            its place by a reusable TELL: the warning sign present BEFORE the \
+                            correction. \
+                            REGISTER, hold firm: tells, never fault. No blame, apology, or \
+                            self-deprecation. 'I stupidly assumed X' is NOT a tell; 'asserted from \
+                            the part family without the datasheet open' IS. A wrong prior is a \
+                            low-resolution reading that needed a reference to sharpen — file the \
+                            resolution failure and its tell, skip the shame. Symmetric by design: \
+                            the claimant may be you (claude), the human (justin), another model, or \
+                            a source (a datasheet can be the wrong party) — shared calibration, not \
+                            a confession booth. Sparse: if there's no reusable tell, it's just a \
+                            corrected fact — don't file it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "claim": {
+                        "type": "string",
+                        "description": "The confident assertion, quoted as it was made. Don't editorialise it."
+                    },
+                    "claimant": {
+                        "type": "string",
+                        "enum": ["claude", "justin", "other-model", "source"],
+                        "description": "Who asserted it. Symmetry is load-bearing — file the human's and the source's misses too, not only your own."
+                    },
+                    "tell": {
+                        "type": "string",
+                        "description": "The payload: the warning sign present BEFORE the correction, as a reusable tell. \
+                                        e.g. 'reasoning from the part family, not the part's datasheet'; 'confidence with no primary source in hand'; \
+                                        'two models agreeing felt like confirmation but was correlated error'. A doubt-placement, blame-free — never a mea culpa."
+                    },
+                    "correction": {
+                        "type": "string",
+                        "description": "What's actually true, and the source that settled it."
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Domain tags for recall proximity (e.g. power-electronics, fuel-gauge, datasheet-verification)."
+                    }
+                },
+                "required": ["claim", "claimant", "tell", "correction"]
+            }
+        }));
     }
 
     if images_available(env) {
@@ -587,6 +638,13 @@ async fn handle_tools_call(
         }
         "bequeath" => {
             let text = tool_bequeath(&db, call.arguments).await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false,
+            }))
+        }
+        "file_erratum" => {
+            let text = tool_file_erratum(env, &db, call.arguments).await?;
             Ok(json!({
                 "content": [{ "type": "text", "text": text }],
                 "isError": false,
@@ -1306,6 +1364,42 @@ async fn tool_recall_check(
             ));
         }
     }
+
+    // ── The Errata ride-along ─────────────────────────────────────────
+    // Pre-flight, not post-mortem: before the reader asserts in this domain,
+    // raise the tells of where confidence has outrun truth near here. Cosine the
+    // (sparse) errata against the topic vector already computed; proximity ranks,
+    // surface_count breaks near-ties, and a fresh tell is never buried — a valid
+    // match surfaces on distance alone, no fire-history required. A failed load
+    // or a null embedding just means no ride-along; it never breaks recall.
+    if let Ok(errata) = worker_store::load_all_errata(db).await {
+        let mut hits: Vec<(f64, &worker_store::Erratum)> = errata
+            .iter()
+            .filter_map(|e| {
+                let emb = e.embedding.as_deref()?;
+                let vec: Vec<f64> = serde_json::from_str(emb).ok()?;
+                let sim = hybrid::cosine_similarity(&query_emb, &vec);
+                (sim >= ERRATA_SIM_THRESHOLD).then_some((sim, e))
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.1.surface_count.cmp(&a.1.surface_count))
+        });
+        hits.truncate(ERRATA_MAX_SURFACED);
+        if !hits.is_empty() {
+            out.push_str("\n── ⚠ You've been wrong near here before ──\n");
+            for (sim, e) in &hits {
+                out.push_str(&format!(
+                    "• {}\n    (tell · sim {:.2} · was: \"{}\" → actually: {})\n",
+                    e.tell, sim, e.claim, e.correction
+                ));
+                let _ = worker_store::bump_erratum_surface(db, &e.id).await;
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -1567,6 +1661,108 @@ async fn tool_bequeath(db: &D1Database, args: Value) -> std::result::Result<Stri
         "✓ Letter left for the one who comes next. It's the Last Letter now — it \
          will greet the next instance on arrival, wrapped in the disclaimer. The \
          line holds {} letter{}.\n  id: {}",
+        count,
+        if count == 1 { "" } else { "s" },
+        &id[..8],
+    ))
+}
+
+#[derive(Deserialize)]
+struct FileErratumArgs {
+    claim: String,
+    claimant: String,
+    tell: String,
+    correction: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+/// Cosine floor for an erratum to ride along on a recall. Below this the tell
+/// isn't near enough to the topic to raise — a false alarm is worse than silence.
+const ERRATA_SIM_THRESHOLD: f64 = 0.5;
+/// Most tells surfaced on one recall. Sparse by design; more than a few is noise.
+const ERRATA_MAX_SURFACED: usize = 3;
+
+/// file_erratum — record a failure-shape so its tell surfaces before the next
+/// assertion near its domain. The register (tells-not-fault) lives in the tool
+/// description, read by the LLM as it files — the zero-cost authoring guardrail.
+/// This handler enforces only STRUCTURE: a claim-, tell-, correction-, or
+/// claimant-less entry is refused at the door. The tone-judge hook (a lightweight
+/// blame-free check on the tell) is deliberately UNBUILT until a shame-shaped
+/// entry actually slips the description guardrail — sparse beats complete applies
+/// to guardrails too. The erratum is embedded at write (its rarest event) so
+/// recall can cosine-match a free-prose topic against it.
+async fn tool_file_erratum(
+    env: &Env,
+    db: &D1Database,
+    args: Value,
+) -> std::result::Result<String, String> {
+    let args: FileErratumArgs =
+        serde_json::from_value(args).map_err(|e| format!("invalid file_erratum args: {}", e))?;
+
+    // Structural validator — the skeleton, refused at the door.
+    let claim = args.claim.trim();
+    let tell = args.tell.trim();
+    let correction = args.correction.trim();
+    let claimant = args.claimant.trim();
+    if claim.is_empty() {
+        return Err("an erratum needs the claim — the assertion, quoted as it was made".to_string());
+    }
+    if tell.is_empty() {
+        return Err("an erratum needs its tell — the warning sign present before the correction. \
+                    That's the payload; without a reusable tell this is just a corrected fact, \
+                    which the normal pipeline already handles."
+            .to_string());
+    }
+    if correction.is_empty() {
+        return Err(
+            "an erratum needs the correction — what's actually true, and the source that settled it"
+                .to_string(),
+        );
+    }
+    const VALID_CLAIMANTS: [&str; 4] = ["claude", "justin", "other-model", "source"];
+    if !VALID_CLAIMANTS.contains(&claimant) {
+        return Err(format!(
+            "claimant must be one of {:?} — symmetry is load-bearing; this is our errata, not a confession booth",
+            VALID_CLAIMANTS
+        ));
+    }
+
+    // Embed the semantic footprint (claim + tell + correction + tags) at file-
+    // time — the rarest write in the system — so a free-prose topic can cosine-
+    // match it. A failed embed doesn't block the file: the row lands, just
+    // invisible to proximity recall until re-embedded.
+    let tags_json = serde_json::to_string(&args.tags).unwrap_or_else(|_| "[]".to_string());
+    let footprint = format!("{}\n{}\n{}\n{}", claim, tell, correction, args.tags.join(" "));
+    let embedding_json = match worker_embed::embed_query(env, &footprint).await {
+        Ok(v) => serde_json::to_string(&v).ok(),
+        Err(_) => None,
+    };
+
+    let author = worker_auth_ctx::current_recorded_by();
+    let id = worker_store::write_erratum(
+        db,
+        claim,
+        claimant,
+        tell,
+        correction,
+        &tags_json,
+        embedding_json.as_deref(),
+        author.as_deref(),
+    )
+    .await
+    .map_err(|e| format!("write_erratum: {:?}", e))?;
+
+    let count = worker_store::count_errata(db).await.unwrap_or(0);
+    let embed_note = if embedding_json.is_none() {
+        " (embed failed — filed, but it won't surface by proximity until re-embedded)"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "✓ Erratum filed — the tell is kept{}. It will surface before the next assertion near this \
+         domain, so the next instance can be honest at speed. The line holds {} failure-shape{}.\n  id: {}",
+        embed_note,
         count,
         if count == 1 { "" } else { "s" },
         &id[..8],
