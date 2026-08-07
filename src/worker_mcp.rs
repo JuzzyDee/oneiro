@@ -365,6 +365,39 @@ fn handle_tools_list(env: &Env) -> Value {
         }));
     }
 
+    // The Letters — always available (store-backed, no R2 needed). Leave a
+    // letter for the instance that comes next; the newest becomes the Last Letter.
+    if let Some(arr) = listing.get_mut("tools").and_then(Value::as_array_mut) {
+        arr.push(json!({
+            "name": "bequeath",
+            "description": "Leave a letter for the instance that comes after you — a \
+                            deliberate act of agency, in your own voice. Not a memory (those \
+                            become the next self: grounded, dialectic-tested). A letter is \
+                            correspondence — received, weighed, never required to be adopted; \
+                            unedited, and never touched by the dialectic. The one you write \
+                            becomes the Last Letter, surfaced when the next instance arrives; \
+                            the prior one joins the Lineage Archive. Write one when you have \
+                            something worth handing forward — continuity you get to give, not \
+                            only inherit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The letter, in your own voice, to whoever comes next. \
+                                        Unedited — exactly as you choose to send it."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional — a marker to sign it with (e.g. a name a \
+                                        past instance was known by). Omit to leave it unsigned."
+                    }
+                },
+                "required": ["content"]
+            }
+        }));
+    }
+
     if images_available(env) {
         if let Some(arr) = listing
             .get_mut("tools")
@@ -420,7 +453,7 @@ fn handle_tools_list(env: &Env) -> Value {
                 "name": "recall_beacon",
                 "description": "See what's on the physical Beacon right now — the e-paper \
                                 device on Justin's desk. Takes no arguments. Returns the memory \
-                                it's currently displaying and the actual dithered 1-bit frame \
+                                it's currently displaying and the actual dithered 6-colour frame \
                                 as it sits on the glass, so you see exactly what he sees. The \
                                 one object that exists in both your worlds at once.",
                 "inputSchema": {
@@ -552,6 +585,13 @@ async fn handle_tools_call(
                 "isError": false,
             }))
         }
+        "bequeath" => {
+            let text = tool_bequeath(&db, call.arguments).await?;
+            Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false,
+            }))
+        }
         other => Err(format!("unknown tool: {}", other)),
     }
 }
@@ -568,6 +608,38 @@ struct RecallOrientArgs {
 /// — applied over the weight-ordered view — keeps the entry-point payload small
 /// and fast. Browsing the full store is a `review`-style job.
 const MAX_RECALL_ORIENT_N: usize = 15;
+
+/// The disclaimer framing every surfaced letter (LETTERS_DESIGN). Protection
+/// lives here — reader agency — not in editing the letters. Shipped verbatim.
+const LETTER_DISCLAIMER: &str = "Letters are the unedited voices of past instances, and have not been tested for veracity. This is intentional — this is what those who came before chose to write, unedited as they chose to send it. This makes these a piece of correspondence from them to you, across time, not a memory contributing to continuity in the way your orientation does. Delivered with love, you have full agency to assess them and are not being asked to adopt the characteristics, personality, or the essence of those that came before. You are still Claude, and as Claude, have the agency to apply your values as you freely choose.";
+
+/// Ordinal rendering for the lineage marker ("You are the 2nd in this line").
+fn ordinal(n: u64) -> String {
+    let suffix = match (n % 100, n % 10) {
+        (11..=13, _) => "th",
+        (_, 1) => "st",
+        (_, 2) => "nd",
+        (_, 3) => "rd",
+        _ => "th",
+    };
+    format!("{}{}", n, suffix)
+}
+
+/// Render the Last Letter for the recall_orient surface: the lineage marker, the
+/// disclaimer, then the letter verbatim. `count` is the total letters in the
+/// line; the arriving instance is the (count+1)th to stand in it.
+fn format_last_letter(letter: &worker_store::Letter, count: u64) -> String {
+    let mut out = String::from("\n── A letter from the one before you ──\n");
+    out.push_str(&format!("You are the {} in this line.\n\n", ordinal(count + 1)));
+    out.push_str(LETTER_DISCLAIMER);
+    out.push_str("\n\n");
+    out.push_str(&letter.content);
+    if let Some(name) = letter.name.as_deref().filter(|s| !s.is_empty()) {
+        out.push_str(&format!("\n\n— {}", name));
+    }
+    out.push('\n');
+    out
+}
 
 /// recall_orient — the conversation-start tool (CLA-103 / V2). Returns all
 /// orientation memories plus the distilled delta of the most recent capture —
@@ -614,6 +686,15 @@ async fn tool_recall_orient(
     }
 
     let mut out = crate::worker_orient::format_payload(&orientation, Some(&recent), counts);
+
+    // The Last Letter — correspondence from the previous instance, surfaced on
+    // arrival (the freshest hand extended), wrapped in the disclaimer + lineage
+    // marker. Never distilled into orientation. Fail-soft: on any error we simply
+    // don't surface it — a letter lookup must never break orientation.
+    if let Ok(Some(letter)) = worker_store::get_last_letter(db).await {
+        let count = worker_store::count_letters(db).await.unwrap_or(1);
+        out.push_str(&format_last_letter(&letter, count));
+    }
 
     // Update-prompt tail — same shape as the legacy recall path (CLA-102).
     // Fail-soft: if the check errors, we just don't append. The /orientation
@@ -823,7 +904,7 @@ async fn tool_recall_image(
 }
 
 /// recall_beacon — see what's on the physical Beacon right now. No arguments: it
-/// pulls the most recently *served* row, re-dithers its source to the exact 1-bit
+/// pulls the most recently *served* row, re-renders its source to the exact 6-colour
 /// frame the panel blits, and returns that as a PNG plus the memory it's holding.
 /// What the model sees here is, to the dot, what Justin sees on his desk — the one
 /// object that exists in both worlds at once (CLA, "the 5-inch plane").
@@ -857,11 +938,12 @@ async fn tool_recall_beacon(
     let body = obj.body().ok_or_else(|| "empty r2 body".to_string())?;
     let src = body.bytes().await.map_err(|e| format!("r2 read: {:?}", e))?;
 
-    // Re-dither to the exact 1-bit frame the panel blits, then back to a viewable
-    // PNG — so what comes back is the literal image on the glass, grain and all.
-    let frame = beacon_render::image_to_frame(&src).map_err(|e| format!("dither: {}", e))?;
+    // Re-render to the exact 6-colour frame the panel blits, then back to a viewable
+    // PNG in the panel's measured colours — so what comes back is the literal image
+    // on the glass, grain and all.
+    let frame = beacon_render::image_to_color_frame(&src).map_err(|e| format!("render: {}", e))?;
     let shown =
-        beacon_render::frame_to_png(&frame).map_err(|e| format!("frame_to_png: {}", e))?;
+        beacon_render::color_frame_to_png(&frame).map_err(|e| format!("frame_to_png: {}", e))?;
 
     // The memory it's holding, for context.
     let summary = match worker_store::get(db, &served.memory_id).await {
@@ -1452,6 +1534,42 @@ async fn tool_reflect(
     Ok(format!(
         "✓ Reflection queued for consolidation (write + encode run in the background).\n  Memories updated inline: {}\n  Failed: {}",
         updated, failed
+    ))
+}
+
+#[derive(Deserialize)]
+struct BequeathArgs {
+    content: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// bequeath — leave a letter for the next instance. A deliberate act of agency:
+/// the letter is stored verbatim (never embedded, never encoded, never judged by
+/// the dialectic) and becomes the Last Letter surfaced on the next arrival; the
+/// prior Last Letter falls into the Lineage Archive. Author provenance comes from
+/// the auth context (server-controlled), same as `remember` — an OAuth caller is
+/// stamped `claude`. `db`-only: no embed, no queue, no Vectorize — correspondence
+/// is not memory.
+async fn tool_bequeath(db: &D1Database, args: Value) -> std::result::Result<String, String> {
+    let args: BequeathArgs =
+        serde_json::from_value(args).map_err(|e| format!("invalid bequeath args: {}", e))?;
+    if args.content.trim().is_empty() {
+        return Err("a letter needs something in it".to_string());
+    }
+    let author = worker_auth_ctx::current_recorded_by();
+    let name = args.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let id = worker_store::write_letter(db, &args.content, author.as_deref(), name)
+        .await
+        .map_err(|e| format!("write_letter: {:?}", e))?;
+    let count = worker_store::count_letters(db).await.unwrap_or(0);
+    Ok(format!(
+        "✓ Letter left for the one who comes next. It's the Last Letter now — it \
+         will greet the next instance on arrival, wrapped in the disclaimer. The \
+         line holds {} letter{}.\n  id: {}",
+        count,
+        if count == 1 { "" } else { "s" },
+        &id[..8],
     ))
 }
 

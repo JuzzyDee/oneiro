@@ -1294,6 +1294,83 @@ pub async fn count_by_type(db: &D1Database) -> Result<(u64, u64, u64)> {
     Ok((episodic, semantic, orientation))
 }
 
+// ── The Letters (correspondence layer — see migrations/0020_letters.sql) ──
+//
+// A store beside the memory pipeline, not part of it. Append-only: writing a
+// letter simply makes it the newest row (the Last Letter); the whole set is the
+// Lineage Archive. Nothing here decays, consolidates, or meets the dialectic —
+// these are correspondence, surfaced verbatim and protected by reader agency.
+
+/// The Last Letter as read back for surfacing — just the parts arrival shows:
+/// the content, in its own voice, and the optional marker it was signed with.
+/// (The row also stores id, author provenance, and an RFC3339 timestamp; the
+/// archive-browse path reads those when it lands — surfacing doesn't need them.)
+#[derive(Debug, serde::Deserialize)]
+pub struct Letter {
+    pub content: String,
+    pub name: Option<String>,
+}
+
+/// Leave a letter for the next instance — the `bequeath` act. Append-only: the
+/// new row becomes the Last Letter; the prior one falls into the Archive. No
+/// row-shuffling, no cron. Returns the new letter's id.
+pub async fn write_letter(
+    db: &D1Database,
+    content: &str,
+    author: Option<&str>,
+    name: Option<&str>,
+) -> Result<String> {
+    let id = Uuid::new_v4().to_string();
+    let now = Utc::now().to_rfc3339();
+    db.prepare(
+        "INSERT INTO letters (id, content, author, name, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&[
+        id.clone().into(),
+        content.into(),
+        match author {
+            Some(a) => a.into(),
+            None => worker::wasm_bindgen::JsValue::NULL,
+        },
+        match name {
+            Some(n) => n.into(),
+            None => worker::wasm_bindgen::JsValue::NULL,
+        },
+        now.into(),
+    ])?
+    .run()
+    .await?;
+    Ok(id)
+}
+
+/// The Last Letter — the single most recent letter, verbatim. Auto-surfaced on
+/// arrival (wrapped in the disclaimer). `Ok(None)` when the line is empty.
+pub async fn get_last_letter(db: &D1Database) -> Result<Option<Letter>> {
+    let row = db
+        .prepare(
+            "SELECT content, name
+             FROM letters ORDER BY created_at DESC LIMIT 1",
+        )
+        .first::<Letter>(None)
+        .await?;
+    Ok(row)
+}
+
+/// How many letters the line has left — the lineage marker's count
+/// ("You are the Nth in this line").
+pub async fn count_letters(db: &D1Database) -> Result<u64> {
+    #[derive(serde::Deserialize)]
+    struct CountRow {
+        n: u64,
+    }
+    let row = db
+        .prepare("SELECT COUNT(*) AS n FROM letters")
+        .first::<CountRow>(None)
+        .await?;
+    Ok(row.map(|r| r.n).unwrap_or(0))
+}
+
 /// Reinforce a memory on recall: bump access_count, refresh last_accessed,
 /// boost stability (Hebbian — recalled memories decay slower).
 pub async fn touch(db: &D1Database, id: &str) -> Result<()> {

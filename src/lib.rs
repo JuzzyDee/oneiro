@@ -386,7 +386,7 @@ async fn beacon_raw_endpoint(env: &Env, req: &Request) -> Result<Response> {
                     .bytes()
                     .await
                     .map_err(|e| (500u16, format!("r2 read: {:?}", e)))?;
-                return beacon_render::image_to_frame(&bytes)
+                return beacon_render::image_to_color_frame(&bytes)
                     .map_err(|e| (500u16, format!("{}: {}", keys[idx], e)));
             }
             // Default: serve the freshest baked image off the shelf and keep
@@ -413,7 +413,7 @@ async fn beacon_raw_endpoint(env: &Env, req: &Request) -> Result<Response> {
                         .bytes()
                         .await
                         .map_err(|e| (500u16, format!("r2 read: {:?}", e)))?;
-                    let frame = beacon_render::image_to_frame(&bytes)
+                    let frame = beacon_render::image_to_color_frame(&bytes)
                         .map_err(|e| (500u16, format!("{}: {}", ready.r2_key, e)))?;
                     // Stamp served only after a clean decode — a decode failure
                     // shouldn't burn the row.
@@ -586,14 +586,24 @@ async fn beacon_pick_clean_text(
     Err((404u16, "no clean memory available".to_string()))
 }
 
-/// The fixed Beacon art prompt — Justin's hand-tuned template, the one that's
-/// produced every sketch so far. Ideogram v4 renders the words into the image.
+/// The Beacon art prompt — one of three bold, dither-friendly colour styles picked
+/// at random per bake (Justin's hand-tuned trio; variety on the shelf). The shared
+/// body carries the Spectra-6-safe colour guidance and the text/clutter guardrails;
+/// only the style clause varies. Ideogram v4 renders the caption into the image.
 fn beacon_prompt(summary: &str) -> String {
+    let style = match (js_sys::Math::random() * 3.0) as u32 {
+        0 => "an anime image in the popular 90s anime aesthetic",
+        1 => "a Looney Tunes-style cartoon in the popular 90s Warner Brothers aesthetic",
+        _ => "a full-colour newspaper-comic-strip illustration with clean bold outlines and flat cel-shaded colour",
+    };
     format!(
-        "Create a 2D black and white sketch using simple strokes, the image \
-         should be a visual representation of the concept behind \"{}\". Those \
-         words should be overlayed or incorporated into the image in some way.",
-        summary
+        "Create {style}. High contrast, bold saturated colours and flat cel-shaded \
+         shapes suited to a limited 6-colour palette — avoid subtle gradients and muted \
+         or desaturated tones. The image should visually represent the concept behind \
+         \"{summary}\", incorporating that text as a single large, bold, highly legible \
+         caption or banner integrated naturally into the composition — not as a dialogue \
+         or thought bubble. Do not render any other readable text, signage, or document \
+         text anywhere else in the image."
     )
 }
 
