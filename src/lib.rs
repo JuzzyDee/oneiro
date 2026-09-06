@@ -91,6 +91,15 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         // round-trip; later it serves the baked memory+art frame. Same auth.
         (Method::Get, "/beacon/raw") => beacon_raw_endpoint(&env, &req).await,
 
+        // Beacon OTA — the firmware update manifest (JSON) + the binary. Same
+        // `beacon`-scoped device auth; both served from R2, written by the
+        // publish step. The device diffs the manifest's `version` against its
+        // own compile-time build and, if newer, pulls /beacon/firmware/bin,
+        // verifies the sha256, and self-flashes. Generic blob — no secrets, no
+        // tenancy (nothing personal in a firmware image).
+        (Method::Get, "/beacon/firmware") => beacon_firmware_manifest_endpoint(&env, &req).await,
+        (Method::Get, "/beacon/firmware/bin") => beacon_firmware_bin_endpoint(&env, &req).await,
+
         // Beacon bake — generate ONE image from a memory via Ideogram and store
         // it in R2 for the read-side to serve. Manual trigger for testing the
         // generation core; the real bake runs from cron/queue. Gated on the
@@ -305,6 +314,109 @@ async fn beacon_endpoint(env: &Env, req: &Request) -> Result<Response> {
             let mut resp = Response::ok(payload)?;
             resp.headers_mut()
                 .set("content-type", "text/plain; charset=utf-8")?;
+            Ok(resp)
+        }
+        Err((code, msg)) => Response::error(msg, code),
+    }
+}
+
+/// GET /beacon/firmware — the OTA update manifest for the Beacon device.
+/// A small JSON blob (`version`, `sha256`, `size`) the device compares against
+/// its own compile-time firmware version; if newer, it fetches
+/// /beacon/firmware/bin, verifies the sha256, and self-flashes. `beacon`-scoped,
+/// same device auth as /beacon/raw. Served straight from R2
+/// (`beacon/firmware/manifest.json`), written by the publish step. 404 until
+/// something's been published.
+async fn beacon_firmware_manifest_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+    let db = env.d1("DB")?;
+
+    let result: std::result::Result<Vec<u8>, (u16, String)> = worker_auth_ctx::AUTH_CTX
+        .scope(auth, async {
+            worker_auth_ctx::check_scope(&db, "beacon")
+                .await
+                .map_err(|e| (403u16, e))?;
+            let bucket = env
+                .bucket("IMAGES")
+                .map_err(|_| (500u16, "IMAGES bucket not configured".to_string()))?;
+            let obj = bucket
+                .get("beacon/firmware/manifest.json")
+                .execute()
+                .await
+                .map_err(|e| (500u16, format!("r2 get: {:?}", e)))?
+                .ok_or((404u16, "no firmware published".to_string()))?;
+            let body = obj.body().ok_or((500u16, "empty r2 body".to_string()))?;
+            body.bytes()
+                .await
+                .map_err(|e| (500u16, format!("r2 read: {:?}", e)))
+        })
+        .await;
+
+    match result {
+        Ok(bytes) => {
+            let mut resp = Response::from_bytes(bytes)?;
+            resp.headers_mut().set("content-type", "application/json")?;
+            resp.headers_mut().set("cache-control", "no-store")?;
+            Ok(resp)
+        }
+        Err((code, msg)) => Response::error(msg, code),
+    }
+}
+
+/// GET /beacon/firmware/bin — the latest Beacon firmware binary (raw bytes).
+/// `beacon`-scoped. Served from R2 (`beacon/firmware/latest.bin`). The device
+/// fetches this only after seeing a newer `version` in the manifest, then
+/// verifies the manifest's sha256 over these bytes before flashing — which also
+/// guards the small window where a publish lands between the two fetches.
+async fn beacon_firmware_bin_endpoint(env: &Env, req: &Request) -> Result<Response> {
+    let bearer = req
+        .headers()
+        .get("authorization")?
+        .and_then(|h| h.strip_prefix("Bearer ").map(|s| s.to_string()));
+    let Some(bearer) = bearer else {
+        return Response::error("Missing Authorization: Bearer <key>", 401);
+    };
+    let Some(auth) = worker_auth_ctx::validate_bearer(env, &bearer).await else {
+        return Response::error("Invalid or unknown bearer token", 401);
+    };
+    let db = env.d1("DB")?;
+
+    let result: std::result::Result<Vec<u8>, (u16, String)> = worker_auth_ctx::AUTH_CTX
+        .scope(auth, async {
+            worker_auth_ctx::check_scope(&db, "beacon")
+                .await
+                .map_err(|e| (403u16, e))?;
+            let bucket = env
+                .bucket("IMAGES")
+                .map_err(|_| (500u16, "IMAGES bucket not configured".to_string()))?;
+            let obj = bucket
+                .get("beacon/firmware/latest.bin")
+                .execute()
+                .await
+                .map_err(|e| (500u16, format!("r2 get: {:?}", e)))?
+                .ok_or((404u16, "no firmware binary published".to_string()))?;
+            let body = obj.body().ok_or((500u16, "empty r2 body".to_string()))?;
+            body.bytes()
+                .await
+                .map_err(|e| (500u16, format!("r2 read: {:?}", e)))
+        })
+        .await;
+
+    match result {
+        Ok(bytes) => {
+            let mut resp = Response::from_bytes(bytes)?;
+            resp.headers_mut()
+                .set("content-type", "application/octet-stream")?;
+            resp.headers_mut().set("cache-control", "no-store")?;
             Ok(resp)
         }
         Err((code, msg)) => Response::error(msg, code),
