@@ -999,7 +999,14 @@ async fn tool_recall_beacon(
     // Re-render to the exact 6-colour frame the panel blits, then back to a viewable
     // PNG in the panel's measured colours — so what comes back is the literal image
     // on the glass, grain and all.
-    let frame = beacon_render::image_to_color_frame(&src).map_err(|e| format!("render: {}", e))?;
+    // A baked row already stores the device-ready frame — use it directly so the
+    // twin is the literal frame on the glass. A legacy PNG-keyed row is rendered
+    // to the frame first, as before.
+    let frame = if served.r2_key.starts_with("beacon/frames/") {
+        src
+    } else {
+        beacon_render::image_to_color_frame(&src).map_err(|e| format!("render: {}", e))?
+    };
     let shown =
         beacon_render::color_frame_to_png(&frame).map_err(|e| format!("frame_to_png: {}", e))?;
 

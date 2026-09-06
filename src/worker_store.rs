@@ -514,7 +514,7 @@ pub async fn record_beacon_image(
 ) -> Result<String> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
-    // Synchronous bake: the PNG already exists, so the row lands 'ready'
+    // Synchronous bake: the frame already exists, so the row lands 'ready'
     // (the schema defaults to 'baking' for the async write-first path).
     db.prepare(
         "INSERT INTO beacon_images (id, memory_id, r2_key, generated_at, status, served_at)
@@ -534,8 +534,8 @@ pub struct ReadyBeaconImage {
 }
 
 /// Fetch the freshest image still waiting for delivery (`status='ready'`).
-/// `Ok(None)` when the shelf is empty. The delivery side downloads `r2_key`,
-/// dithers it, then calls `mark_beacon_served`.
+/// `Ok(None)` when the shelf is empty. The delivery side streams `r2_key`
+/// (a pre-rendered frame) verbatim, then calls `mark_beacon_served`.
 pub async fn get_ready_beacon_image(db: &D1Database) -> Result<Option<ReadyBeaconImage>> {
     db.prepare(
         "SELECT id, r2_key FROM beacon_images
@@ -721,7 +721,7 @@ pub async fn get_beacon_bake_memory(db: &D1Database, id: &str) -> Result<Option<
     Ok(row.map(|r| r.memory_id))
 }
 
-/// Flip a `baking` row to `ready` with its stored PNG. Guarded on `status =
+/// Flip a `baking` row to `ready` with its rendered frame. Guarded on `status =
 /// 'baking'` so a reaped/superseded row is never resurrected.
 pub async fn complete_beacon_bake(db: &D1Database, id: &str, r2_key: &str) -> Result<()> {
     db.prepare("UPDATE beacon_images SET status = 'ready', r2_key = ? WHERE id = ? AND status = 'baking'")

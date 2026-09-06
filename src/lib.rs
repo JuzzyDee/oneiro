@@ -43,6 +43,7 @@ mod worker_version;
 mod beacon_render;
 mod worker_wake;
 mod worker_beacon_bake;
+mod worker_beacon_battery;
 
 use worker::{
     event, Context, D1Database, Env, MessageBatch, MessageBuilder, Method, Request, Response,
@@ -328,6 +329,19 @@ async fn beacon_raw_endpoint(env: &Env, req: &Request) -> Result<Response> {
         return Response::error("Invalid or unknown bearer token", 401);
     };
 
+    // Best-effort telemetry: the device stamps its fuel-gauge SoC into an
+    // X-Beacon-Battery header on every fetch. Record it and fire a one-shot
+    // low-battery email if it just crossed the threshold. Never fails the serve.
+    if let Some(pct) = req
+        .headers()
+        .get("x-beacon-battery")?
+        .and_then(|s| s.trim().parse::<u8>().ok())
+    {
+        if let Err(e) = worker_beacon_battery::record_and_maybe_alert(env, pct.min(100)).await {
+            worker::console_error!("beacon battery handling failed (non-fatal): {:?}", e);
+        }
+    }
+
     let url = req.url()?;
     let want_test = url.query_pairs().any(|(k, _)| k == "test");
     let want_dither = url.query_pairs().any(|(k, _)| k == "dither");
@@ -413,8 +427,17 @@ async fn beacon_raw_endpoint(env: &Env, req: &Request) -> Result<Response> {
                         .bytes()
                         .await
                         .map_err(|e| (500u16, format!("r2 read: {:?}", e)))?;
-                    let frame = beacon_render::image_to_color_frame(&bytes)
-                        .map_err(|e| (500u16, format!("{}: {}", ready.r2_key, e)))?;
+                    // Baked frames are stored device-ready — stream verbatim (the
+                    // fast path this split exists for; the inline dither was
+                    // eating ~5s and tipping the device read timeout → -11). A
+                    // legacy PNG-keyed row still on the shelf at deploy cutover
+                    // decodes inline, as before.
+                    let frame = if ready.r2_key.starts_with("beacon/frames/") {
+                        bytes
+                    } else {
+                        beacon_render::image_to_color_frame(&bytes)
+                            .map_err(|e| (500u16, format!("{}: {}", ready.r2_key, e)))?
+                    };
                     // Stamp served only after a clean decode — a decode failure
                     // shouldn't burn the row.
                     worker_store::mark_beacon_served(&db, &ready.id)

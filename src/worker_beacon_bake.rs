@@ -1,11 +1,14 @@
 //! Beacon image generation — the bake's write-side. Calls Ideogram with a
-//! memory-derived prompt, downloads the (ephemeral) result, and stores the PNG
-//! in R2 under `beacon/samples/`. The read-side (`/beacon/raw`) then decodes +
-//! dithers + serves it via the pipeline already proven.
+//! memory-derived prompt, downloads the (ephemeral) result, renders the
+//! device-ready 6-colour frame, and stores that frame in R2 under
+//! `beacon/frames/` (the returned key) alongside the source PNG under
+//! `beacon/samples/` (kept for debugging / re-dithering a future pipeline).
+//! The read-side (`/beacon/raw`) then streams the frame verbatim — no decode
+//! or dither on the device-fetch hot path.
 //!
-//! Generation is synchronous but slow (seconds–30s), so this is meant to run
-//! *off* the device-fetch path — a cron/queue bake. The manual `/beacon/bake`
-//! endpoint triggers a single generation for testing.
+//! Both the generation (seconds–30s) and the dither now run here, *off* the
+//! device-fetch path — a cron/queue bake. The manual `/beacon/bake` endpoint
+//! triggers a single generation for testing.
 //!
 //! Contract (verified against developer.ideogram.ai, Ideogram 4.0 — v4 renders
 //! text in-image, which v3 wouldn't):
@@ -87,9 +90,23 @@ pub async fn generate_and_store(env: &Env, prompt: &str) -> Result<String> {
     }
     let png = img.bytes().await?;
 
-    let bucket = env.bucket("IMAGES")?;
-    let key = format!("beacon/samples/gen-{}.png", uuid::Uuid::new_v4());
-    bucket.put(&key, png).execute().await?;
+    // Pre-render the device-ready 6-colour frame here, at bake time, so the
+    // device-fetch path (/beacon/raw) is a pure byte-stream — no decode/dither
+    // on the hot path. That inline render was costing ~5s and tipping the
+    // device's read timeout into -11 on a cold Worker. Render from the PNG we
+    // already hold (no R2 round-trip), then store both: the frame under
+    // `beacon/frames/` (what the device eats) and the source PNG under
+    // `beacon/samples/` (kept for debugging / re-dithering). Shared uuid links
+    // the two.
+    let frame = crate::beacon_render::image_to_color_frame(&png)
+        .map_err(|e| Error::RustError(format!("bake render frame: {e}")))?;
 
-    Ok(key)
+    let bucket = env.bucket("IMAGES")?;
+    let id = uuid::Uuid::new_v4();
+    let frame_key = format!("beacon/frames/gen-{id}.bin");
+    bucket.put(&frame_key, frame).execute().await?;
+    let png_key = format!("beacon/samples/gen-{id}.png");
+    bucket.put(&png_key, png).execute().await?;
+
+    Ok(frame_key)
 }
