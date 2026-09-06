@@ -442,14 +442,22 @@ async fn beacon_raw_endpoint(env: &Env, req: &Request) -> Result<Response> {
     };
 
     // Best-effort telemetry: the device stamps its fuel-gauge SoC into an
-    // X-Beacon-Battery header on every fetch. Record it and fire a one-shot
-    // low-battery email if it just crossed the threshold. Never fails the serve.
+    // X-Beacon-Battery header and its running firmware into X-Beacon-Version on
+    // every fetch. Record both and fire a one-shot low-battery email if it just
+    // crossed the threshold. Never fails the serve.
+    let fw_version = req
+        .headers()
+        .get("x-beacon-version")?
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     if let Some(pct) = req
         .headers()
         .get("x-beacon-battery")?
         .and_then(|s| s.trim().parse::<u8>().ok())
     {
-        if let Err(e) = worker_beacon_battery::record_and_maybe_alert(env, pct.min(100)).await {
+        if let Err(e) =
+            worker_beacon_battery::record_and_maybe_alert(env, pct.min(100), fw_version).await
+        {
             worker::console_error!("beacon battery handling failed (non-fatal): {:?}", e);
         }
     }

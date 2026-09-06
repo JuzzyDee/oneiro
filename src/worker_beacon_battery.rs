@@ -2,10 +2,13 @@
 //!
 //! The colour Spectra panel can't do a partial-refresh low-battery warning on
 //! the glass, so the alert lives here on the server instead. The device stamps
-//! its fuel-gauge state-of-charge into an `X-Beacon-Battery` header on every
-//! `/beacon/raw` fetch (twice a day). We keep a *single overwritten value* in KV
-//! — the latest percent plus an "already alerted" flag, no history — and email
-//! once when it crosses the low line, re-arming only after a real charge.
+//! its fuel-gauge state-of-charge into an `X-Beacon-Battery` header (and its
+//! running firmware version into `X-Beacon-Version`) on every `/beacon/raw`
+//! fetch (twice a day). We keep a *single overwritten value* in KV — the latest
+//! percent, an "already alerted" flag, and the last firmware version that
+//! checked in — and email once when it crosses the low line, re-arming only
+//! after a real charge. The version lets us confirm an unattended OTA "took"
+//! without a serial cable: publish, let it wake, then read this KV record.
 
 use serde::{Deserialize, Serialize};
 use worker::{Env, Fetch, Headers, Method, Request, RequestInit, Result};
@@ -25,12 +28,17 @@ const MAIL_TO: &str = "juzzydee@gmail.com";
 struct BatteryState {
     pct: u8,
     alerted: bool,
+    // Last firmware version the device reported (X-Beacon-Version). `default` so
+    // pre-existing {pct,alerted} records deserialize cleanly. Omitted from the
+    // JSON until a version has actually checked in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
 }
 
 /// Record the latest reported SoC and email once if it just crossed the low
 /// line. Best-effort: the caller logs and swallows any error so battery
 /// telemetry can never fail the image serve.
-pub async fn record_and_maybe_alert(env: &Env, pct: u8) -> Result<()> {
+pub async fn record_and_maybe_alert(env: &Env, pct: u8, version: Option<String>) -> Result<()> {
     let kv = env.kv(KV_BINDING)?;
 
     let mut state: BatteryState = kv
@@ -42,6 +50,11 @@ pub async fn record_and_maybe_alert(env: &Env, pct: u8) -> Result<()> {
 
     let was_alerted = state.alerted;
     state.pct = pct;
+    // Record the reporting firmware version; never clobber a known one with a
+    // missing header.
+    if version.is_some() {
+        state.version = version;
+    }
 
     // Hysteresis: fire once on the way down; re-arm only after a real charge.
     let mut send = false;
