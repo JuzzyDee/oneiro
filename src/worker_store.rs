@@ -1572,6 +1572,34 @@ pub async fn reframe(
     Ok(true)
 }
 
+/// Orientation memories distilled (in part) from `source_id` via a
+/// `semantic_orientation` lineage edge — the identity nodes that stand,
+/// partly, on this memory. Surfaced for review when the source is forgotten
+/// (inform, don't prescribe): the edge is deleted with the forget and is
+/// otherwise unrecoverable. Returns (id, summary) pairs.
+pub async fn orientation_descendants(
+    db: &D1Database,
+    source_id: &str,
+) -> Result<Vec<(String, String)>> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        id: String,
+        summary: String,
+    }
+    let rows: Vec<Row> = db
+        .prepare(
+            "SELECT o.id, COALESCE(o.summary, '') AS summary
+             FROM consolidation_lineage l
+             JOIN memories o ON o.id = l.parent_id
+             WHERE l.source_id = ? AND l.edge_type = 'semantic_orientation'",
+        )
+        .bind(&[source_id.into()])?
+        .all()
+        .await?
+        .results()?;
+    Ok(rows.into_iter().map(|r| (r.id, r.summary)).collect())
+}
+
 /// Forget a memory — DELETE plus a tombstone row. Orientation memories
 /// cannot be forgotten (identity is non-negotiable). Returns whether a
 /// row was actually removed.
@@ -1587,6 +1615,16 @@ pub async fn forget(db: &D1Database, id: &str) -> Result<bool> {
 
     // Clean co-activations first (FK references memories).
     db.prepare("DELETE FROM co_activations WHERE memory_a = ? OR memory_b = ?")
+        .bind(&[id.into(), id.into()])?
+        .run()
+        .await?;
+
+    // Clean lineage edges too — consolidation_lineage FKs both parent_id and
+    // source_id -> memories (added post-rearch, after the co-activation fix).
+    // NB: tool_forget surfaces this memory's `semantic_orientation` orientation
+    // descendants to Claude *before* calling us — those edges vanish here and
+    // are otherwise unrecoverable (inform, don't prescribe).
+    db.prepare("DELETE FROM consolidation_lineage WHERE parent_id = ? OR source_id = ?")
         .bind(&[id.into(), id.into()])?
         .run()
         .await?;

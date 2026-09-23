@@ -1538,6 +1538,15 @@ async fn tool_forget(
             .to_string());
     }
 
+    // Capture the orientation memories this one is part of the basis for,
+    // *before* forget() deletes the lineage — the edge is gone afterward and
+    // unrecoverable, so this is Claude's only chance to know a piece of the
+    // identity layer just lost some of its recorded ground. The forget still
+    // proceeds regardless; we inform, we don't prescribe or block.
+    let orientation_basis = worker_store::orientation_descendants(db, &memory.id)
+        .await
+        .unwrap_or_default();
+
     let removed = worker_store::forget(db, &memory.id)
         .await
         .map_err(|e| format!("forget: {:?}", e))?;
@@ -1549,11 +1558,23 @@ async fn tool_forget(
     // rows would haunt future recalls otherwise.
     let _ = worker_vectorize::delete_ids(env, &[memory.id.as_str()]).await;
 
-    Ok(format!(
+    let mut out = format!(
         "✓ Forgotten: {} (id: {}). Tombstone recorded.",
         memory.summary,
         &memory.id[..8]
-    ))
+    );
+    if !orientation_basis.is_empty() {
+        out.push_str(
+            "\n\n⚠ What you just forgot was part of the recorded basis for the \
+             orientation memories below — that lineage link is now gone with it. \
+             Review at your discretion; you may want to reframe them, or let them \
+             stand. (Orientation can't be forgotten, only reframed.)",
+        );
+        for (id, summary) in &orientation_basis {
+            out.push_str(&format!("\n  \u{2022} {} (id: {})", summary, &id[..8]));
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize)]
